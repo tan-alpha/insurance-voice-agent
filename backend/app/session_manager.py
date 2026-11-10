@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Set
 
@@ -419,15 +420,15 @@ class SessionManager:
         await _run_and_cleanup()
 
     async def _nudge_chat_after_call(self, session_id: str) -> None:
-        """On /call disconnect, update call_seconds, send call-ended chat message,
+        """On /call disconnect, send call-ended chat message,
         and dispatch the next missing input request for chat continuation."""
         lock = await self._session_lock(session_id)
         async with lock:
             state = self.store.get_or_create_session(session_id)
             state.last_activity = datetime.now(KOLKATA).isoformat()
+            self.store.save_session(state)
             if state.outcome in {"completed", "optedOut", "needsReview"}:
                 return
-            self.store.save_session(state)
             # Send call-ended message over /chat.
             await self._send_ws(
                 "chat",
@@ -587,14 +588,34 @@ class SessionManager:
 
     @staticmethod
     def _terminal_record(state: SessionState):
-        from .protocol import FinalRecord, Outcome
+        from .protocol import FinalRecord, Outcome, RecordField, FieldStatus
+        from .validator import REQUIRED_FIELDS
+
+        now_iso = state.ended_at or state.updated_at or datetime.now(KOLKATA).isoformat()
+        fields_dict = dict(state.fields)
+        for f in REQUIRED_FIELDS + ["email"]:
+            if f not in fields_dict:
+                if state.failure_counts.get(f, 0) > 0:
+                    fields_dict[f] = RecordField(
+                        value=None,
+                        source=None,
+                        collected_at=now_iso,
+                        status=FieldStatus.INVALID,
+                    )
+                else:
+                    fields_dict[f] = RecordField(
+                        value=None,
+                        source=None,
+                        collected_at=None,
+                        status=FieldStatus.MISSING,
+                    )
 
         return FinalRecord(
             session_id=state.session_id,
             revision=state.revision,
             outcome=Outcome(state.outcome),
             outcome_reason=state.outcome_reason,
-            fields=dict(state.fields),
+            fields=fields_dict,
             conflicts=list(state.conflicts) if state.conflicts else None,
             engagement=state.engagement,
             cost_usd=state.cost_usd or None,

@@ -124,14 +124,19 @@ VALID_CASES = [
     ("incidentLocation", "ab", FieldSource.CALL, False),
     ("incidentTime", "today at 9:30am", FieldSource.CALL, True),
     ("incidentTime", "2 hours ago", FieldSource.CALL, True),
+    ("incidentTime", "two hours ago", FieldSource.CALL, True),
+    ("incidentTime", "about two hours ago", FieldSource.CALL, True),
+    ("incidentTime", "around two hours ago", FieldSource.CALL, True),
     ("incidentTime", "2099-01-01 10:00", FieldSource.CALL, False),
     ("incidentTime", "not a date", FieldSource.CALL, False),
     ("injuries", "no one hurt", FieldSource.CALL, True),
+    ("injuries", "nobody was hurt", FieldSource.CALL, True),
     ("injuries", "whiplash in neck", FieldSource.CALL, True),
     ("injuries", "ow", FieldSource.CALL, False),
     ("vehicleDrivable", True, FieldSource.CALL, True),
     ("vehicleDrivable", "yes", FieldSource.CALL, True),
     ("vehicleDrivable", "towed", FieldSource.CALL, True),
+    ("vehicleDrivable", "the car is drivable", FieldSource.CALL, True),
     ("vehicleDrivable", "maybe", FieldSource.CALL, False),
     ("policyNumber", "POL-123456", FieldSource.CHAT, True),
     ("policyNumber", "POL-1234567", FieldSource.CHAT, False),
@@ -218,6 +223,12 @@ def test_three_strikes_policyNumber_needsReview():
     assert record.outcome == Outcome.NEEDS_REVIEW
     assert record.revision == 1
     assert state.revision == 1
+    # Verify missing & invalid fields are properly structured in record.fields
+    assert record.fields["policyNumber"].status == FieldStatus.INVALID
+    assert record.fields["policyNumber"].value is None
+    assert record.fields["incidentDescription"].status == FieldStatus.MISSING
+    assert record.fields["incidentDescription"].value is None
+    assert record.fields["email"].status == FieldStatus.MISSING
 
 
 # ---------------------------------------------------------------------------

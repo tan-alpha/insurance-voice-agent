@@ -87,6 +87,9 @@ def _normalize_policy_number(value: str) -> str:
 def _parse_incident_time(raw: str, now_iso: Optional[str]) -> Optional[str]:
     """Parse ISO-8601 or natural expressions into ISO-8601 +05:30.
 
+    Supports relative offsets ('2 hours ago', 'two hours ago', 'about 30 minutes ago'),
+    named periods ('today morning', 'yesterday evening', 'midnight'),
+    clock times ('today at 9:30am', 'around 12 am', 'twelve am'), and ISO formats.
     Returns None when the value cannot be parsed or is out of range.
     """
     text = _collapse_whitespace(raw).strip()
@@ -115,38 +118,64 @@ def _parse_incident_time(raw: str, now_iso: Optional[str]) -> Optional[str]:
             continue
 
     if candidate is None:
-        # "2 hours ago", "30 minutes ago".
-        m = re.match(r"^(\d+)\s+(minute|minutes|min|hour|hours|hr)s?\s+ago$", lowered)
-        if m:
-            n = int(m.group(1))
-            unit = m.group(2)
-            delta = timedelta(hours=n) if unit.startswith("hour") or unit.startswith("hr") else timedelta(minutes=n)
+        # Strip conversational leading filler phrases from spoken input.
+        cleaned = re.sub(
+            r"^(?:it\s+was\s+|happened\s+|occurred\s+|around\s+|about\s+|approx(?:\.|imately)?\s+|roughly\s+|maybe\s+|at\s+)+",
+            "",
+            lowered,
+        ).strip()
+
+        # Word numbers and common conversational time spans.
+        word_map = {
+            "half an hour ago": "30 minutes ago",
+            "half a hour ago": "30 minutes ago",
+            "an hour ago": "1 hour ago",
+            "a hour ago": "1 hour ago",
+            "a couple of hours ago": "2 hours ago",
+            "a few hours ago": "3 hours ago",
+            "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+            "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+            "eleven": "11", "twelve": "12", "midnight": "12 am", "noon": "12 pm",
+        }
+        for k, v in word_map.items():
+            cleaned = re.sub(r"\b" + k + r"\b", v, cleaned)
+
+        # "2 hours ago", "30 minutes ago", or embedded in phrase.
+        m_ago = re.search(r"(\d+)\s*(minute|minutes|min|mins|hour|hours|hr|hrs)\s*ago", cleaned)
+        if m_ago:
+            n = int(m_ago.group(1))
+            unit = m_ago.group(2)
+            delta = timedelta(hours=n) if unit.startswith("h") else timedelta(minutes=n)
             candidate = now - delta
-        elif lowered in ("today", "today morning", "this morning"):
+        elif cleaned in ("today", "today morning", "this morning"):
             candidate = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        elif lowered in ("today afternoon", "this afternoon"):
+        elif cleaned in ("today afternoon", "this afternoon"):
             candidate = now.replace(hour=15, minute=0, second=0, microsecond=0)
-        elif lowered in ("today evening", "this evening"):
+        elif cleaned in ("today evening", "this evening"):
             candidate = now.replace(hour=19, minute=0, second=0, microsecond=0)
-        elif lowered == "yesterday":
+        elif cleaned == "yesterday":
             candidate = (now - timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-        elif lowered == "yesterday morning":
+        elif cleaned == "yesterday morning":
             candidate = (now - timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-        elif lowered == "yesterday afternoon":
+        elif cleaned == "yesterday afternoon":
             candidate = (now - timedelta(days=1)).replace(hour=15, minute=0, second=0, microsecond=0)
-        elif lowered == "yesterday evening":
+        elif cleaned == "yesterday evening":
             candidate = (now - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
         else:
-            m = re.match(r"^today at (\d{1,2})(?::(\d{2}))?\s*(am|pm)?$", lowered)
-            if m:
-                hour = int(m.group(1))
-                minute = int(m.group(2) or 0)
-                ampm = m.group(3)
+            # Matches "today at 9:30am", "at 12 am", "12 am", "9:30 am", etc.
+            m_time = re.search(r"(?:today\s+at\s+|at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)", cleaned)
+            if m_time:
+                hour = int(m_time.group(1))
+                minute = int(m_time.group(2) or 0)
+                ampm = m_time.group(3)
                 if ampm == "pm" and hour != 12:
                     hour += 12
-                if ampm == "am" and hour == 12:
+                elif ampm == "am" and hour == 12:
                     hour = 0
                 candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                # If parsed clock time is in the future compared to now, assume earlier today / yesterday
+                if candidate > now + timedelta(minutes=5):
+                    candidate -= timedelta(days=1)
             else:
                 return None
 
@@ -200,9 +229,17 @@ def validate_field(
 
     if field == "injuries":
         v = _collapse_whitespace(str(raw_value)).strip().lower()
-        none_tokens = {"no", "none", "no one hurt", "nobody"}
+        none_tokens = {
+            "no", "none", "no one hurt", "nobody", "nobody was hurt",
+            "no one was hurt", "no injuries", "no injury", "not hurt",
+            "everyone is fine", "nobody is hurt", "nil", "na", "n/a",
+            "no bodily injury", "no one injured", "nobody injured",
+        }
         if v in none_tokens:
             return True, "none", None
+        if any(v.startswith(p) for p in ("no ", "none", "nobody", "no one", "no injury", "not injured")):
+            if not any(inj in v for inj in ("broken", "bleed", "fracture", "pain", "hospital", "whiplash", "concussion", "hurt my", "injured my")):
+                return True, "none", None
         if len(v) >= 3:
             return True, v, None
         return False, v, "injuries must be 'none' or describe the injury"
@@ -211,11 +248,19 @@ def validate_field(
         if isinstance(raw_value, bool):
             return True, raw_value, None
         v = _collapse_whitespace(str(raw_value)).strip().lower()
-        true_tokens = {"yes", "true", "drivable"}
-        false_tokens = {"no", "false", "not drivable", "towed"}
-        if v in true_tokens:
+        true_tokens = {
+            "yes", "true", "drivable", "car is drivable", "it is drivable",
+            "it's drivable", "driveable", "yes drivable", "yes it is", "car works",
+            "yes it is drivable",
+        }
+        false_tokens = {
+            "no", "false", "not drivable", "towed", "undrivable",
+            "not driveable", "cannot drive", "can't drive", "it was towed",
+            "car is not drivable", "it is not drivable", "no it is not drivable",
+        }
+        if v in true_tokens or ("drivable" in v and "not" not in v and "un" not in v):
             return True, True, None
-        if v in false_tokens:
+        if v in false_tokens or "not drivable" in v or "towed" in v:
             return True, False, None
         return False, v, "vehicleDrivable must be yes/no"
 
@@ -468,12 +513,30 @@ def _build_record(state: SessionState, outcome: Outcome,
         chat_messages=state.engagement.chat_messages,
     )
 
+    fields_dict = dict(state.fields)
+    for f in REQUIRED_FIELDS + ["email"]:
+        if f not in fields_dict:
+            if state.failure_counts.get(f, 0) > 0:
+                fields_dict[f] = RecordField(
+                    value=None,
+                    source=None,
+                    collected_at=now_iso,
+                    status=FieldStatus.INVALID,
+                )
+            else:
+                fields_dict[f] = RecordField(
+                    value=None,
+                    source=None,
+                    collected_at=None,
+                    status=FieldStatus.MISSING,
+                )
+
     return FinalRecord(
         session_id=state.session_id,
         revision=state.revision,
         outcome=outcome,
         outcome_reason=reason,
-        fields=dict(state.fields),
+        fields=fields_dict,
         conflicts=list(state.conflicts) if state.conflicts else None,
         engagement=engagement,
         cost_usd=state.cost_usd if state.cost_usd else None,

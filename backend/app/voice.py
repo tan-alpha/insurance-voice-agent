@@ -106,6 +106,9 @@ class DeepgramLiveSTT(STTProvider):
         self.api_key = api_key
         self._ws: Optional[Any] = None
         self._connect_task: Optional[asyncio.Task] = None
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._connect_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
         self._event_queue: asyncio.Queue[STTEvent] = asyncio.Queue()
 
     async def _connect(self) -> None:
@@ -115,46 +118,77 @@ class DeepgramLiveSTT(STTProvider):
             "wss://api.deepgram.com/v1/listen?"
             "model=nova-3&encoding=linear16&sample_rate=16000&channels=1"
             "&interim_results=true&utterance_end_ms=1000&vad_events=true"
-            "&endpointing=300"
+            "&endpointing=300&numerals=true&smart_format=true"
         )
         self._ws = await websockets.connect(
             url, additional_headers={"Authorization": f"Token {self.api_key}"}
         )
-        self._connect_task = asyncio.create_task(self._reader())
+        ws = self._ws
+        self._connect_task = asyncio.create_task(self._reader(ws))
+        self._keepalive_task = asyncio.create_task(self._keepalive(ws))
 
-    async def _reader(self) -> None:
-        assert self._ws is not None
-        async for message in self._ws:
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                continue
-            if data.get("type") == "SpeechStarted":
-                self._event_queue.put_nowait(STTEvent(kind="speech_started"))
-            elif data.get("is_final"):
-                transcript = data.get("channel", {}).get("alternatives", [{}])[0].get(
-                    "transcript", ""
-                )
-                if transcript:
-                    self._event_queue.put_nowait(
-                        STTEvent(kind="transcript", text=transcript, is_final=True)
+    async def _reader(self, ws: Any) -> None:
+        try:
+            async for message in ws:
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("type") == "SpeechStarted":
+                    self._event_queue.put_nowait(STTEvent(kind="speech_started"))
+                elif data.get("is_final"):
+                    transcript = data.get("channel", {}).get("alternatives", [{}])[0].get(
+                        "transcript", ""
                     )
+                    if transcript:
+                        self._event_queue.put_nowait(
+                            STTEvent(kind="transcript", text=transcript, is_final=True)
+                        )
+        except Exception:
+            pass
+        finally:
+            if self._ws is ws:
+                self._ws = None
+
+    async def _keepalive(self, ws: Any) -> None:
+        while self._ws is ws:
+            try:
+                await asyncio.sleep(5)
+                if self._ws is not ws:
+                    break
+                async with self._send_lock:
+                    await ws.send(json.dumps({"type": "KeepAlive"}))
+            except Exception:
+                break
 
     async def ingest(self, pcm_frame: bytes) -> List[STTEvent]:
         if self._ws is None:
-            await self._connect()
-        assert self._ws is not None
-        await self._ws.send(pcm_frame)
+            async with self._connect_lock:
+                if self._ws is None:
+                    await self._connect()
+        if self._ws is not None:
+            try:
+                async with self._send_lock:
+                    await self._ws.send(pcm_frame)
+            except Exception:
+                self._ws = None
         events: List[STTEvent] = []
         while not self._event_queue.empty():
             events.append(self._event_queue.get_nowait())
         return events
 
     async def close(self) -> None:
-        if self._connect_task:
+        if self._connect_task and not self._connect_task.done():
             self._connect_task.cancel()
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
         if self._ws:
-            await self._ws.close()
+            ws = self._ws
+            self._ws = None
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -189,15 +223,30 @@ class OpenAILLM(LLMProvider):
                 "type": "function",
                 "function": {
                     "name": "record_spoken_fields",
-                    "description": "Record fields collected on the voice call.",
+                    "description": "Record claim fields collected from user speech.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "incidentDescription": {"type": "string"},
-                            "incidentLocation": {"type": "string"},
-                            "incidentTime": {"type": "string"},
-                            "injuries": {"type": "string"},
-                            "vehicleDrivable": {"type": "boolean"},
+                            "incidentDescription": {
+                                "type": "string",
+                                "description": "What happened during the incident (e.g. 'Car accident on empty road').",
+                            },
+                            "incidentLocation": {
+                                "type": "string",
+                                "description": "Where the incident occurred (e.g. 'MG Road', 'empty road').",
+                            },
+                            "incidentTime": {
+                                "type": "string",
+                                "description": "When the incident happened, e.g. '2 hours ago', 'today at 10am', '12 am', or ISO-8601.",
+                            },
+                            "injuries": {
+                                "type": "string",
+                                "description": "Injuries to any person. Use 'none' if nobody was hurt / no injuries.",
+                            },
+                            "vehicleDrivable": {
+                                "type": "boolean",
+                                "description": "True if the car can still be driven safely, False if towed or undrivable.",
+                            },
                             "email": {"type": "string"},
                             "policyNumber": {"type": "string"},
                         },
@@ -248,7 +297,9 @@ class OpenAILLM(LLMProvider):
             "You are a motor insurance claims voice assistant. "
             "Collect the claim details through conversation. "
             f"Current session state: {state_summary}. "
-            "Use record_spoken_fields to persist anything the user says. "
+            "Use record_spoken_fields to persist any fields the user mentions: "
+            "incidentDescription, incidentLocation, incidentTime, injuries ('none' if nobody hurt), "
+            "and vehicleDrivable (true/false). "
             "Use request_chat_card when a field is better collected in chat "
             "(policy number, vehicle type, damage photos, email, confirmation). "
             "Use opt_out_session if the user explicitly cancels. "
@@ -448,6 +499,10 @@ class VoicePipelineSession:
         self.llm_cost_usd: float = 0.0
         self.tts_cost_usd: float = 0.0
 
+        # Call duration tracking.
+        self._call_started_at: float = time.monotonic()
+        self._initial_call_seconds: Optional[int] = None
+
     # ------------------------------------------------------------------ lifecycle
 
     async def run(self, ws) -> None:
@@ -468,6 +523,12 @@ class VoicePipelineSession:
 
     async def close(self) -> None:
         self._closed = True
+        try:
+            state = self.store.get_or_create_session(self.session_id)
+            state.engagement.call_seconds = self._elapsed_call_seconds(state)
+            self.store.save_session(state)
+        except Exception:
+            pass
         if self._speech_task and not self._speech_task.done():
             self._speech_task.cancel()
             try:
@@ -845,4 +906,6 @@ class VoicePipelineSession:
         )
 
     def _elapsed_call_seconds(self, state: SessionState) -> int:
-        return state.engagement.call_seconds
+        if self._initial_call_seconds is None:
+            self._initial_call_seconds = state.engagement.call_seconds
+        return self._initial_call_seconds + max(1, int(time.monotonic() - self._call_started_at))
