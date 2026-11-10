@@ -351,6 +351,34 @@ class SessionManager:
                 await greet_session.speak_context_greeting(state)
 
             asyncio.create_task(_send_greeting())
+        else:
+            if os.getenv("DEEPGRAM_API_KEY"):
+
+                async def _send_initial_greeting() -> None:
+                    stt, llm, tts = self._resolve_voice_providers()
+
+                    async def send_call(text: str) -> None:
+                        await self._send_ws("call", session_id, text)
+
+                    async def send_chat(text: str) -> None:
+                        await self._send_ws("chat", session_id, text)
+
+                    greet_session = VoicePipelineSession(
+                        session_id=session_id,
+                        store=self.store,
+                        stt=stt,
+                        llm=llm,
+                        tts=tts,
+                        send_call=send_call,
+                        send_chat=send_chat,
+                        close_call=close_call,
+                    )
+                    await greet_session._speak(
+                        "Hi! I'm your motor insurance claims assistant. Can you tell me what happened, where, and when?",
+                        state,
+                    )
+
+                asyncio.create_task(_send_initial_greeting())
 
         stt, llm, tts = self._resolve_voice_providers()
 
@@ -510,9 +538,23 @@ class SessionManager:
             else:
                 stt = MockSTTProvider()
         if llm is None:
-            from .voice import GroqToolLLM, MockLLMProvider
-            if os.getenv("GROQ_API_KEY"):
-                llm = GroqToolLLM(os.getenv("GROQ_API_KEY"))
+            from .voice import OpenAILLM, MockLLMProvider
+            llm_api_key = (
+                os.getenv("OPENROUTER_API_KEY")
+                or os.getenv("GROQ_API_KEY")
+                or os.getenv("LLM_API_KEY")
+            )
+            if llm_api_key:
+                llm = OpenAILLM(
+                    api_key=llm_api_key,
+                    base_url=os.getenv(
+                        "LLM_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"
+                    ),
+                    model=os.getenv(
+                        "LLM_MODEL",
+                        "nvidia/nemotron-3.5-lightning:free",
+                    ),
+                )
             else:
                 llm = MockLLMProvider()
         if tts is None:

@@ -9,10 +9,10 @@ Architecture: STT -> LLM -> TTS with pluggable providers.
 * ``TTSProvider`` synthesizes agent text into raw PCM16 LE mono chunks
   (24 kHz) that are base64-encoded into ``AudioMessage`` packets.
 
-Production providers (Deepgram Live STT, Groq tool-calling LLM, Deepgram
-Aura TTS) are used when ``DEEPGRAM_API_KEY`` / ``GROQ_API_KEY`` are present.
-Deterministic mock providers are used otherwise so the test suite runs 100%
-offline without live API credentials.
+Production providers (Deepgram Live STT, OpenAI-compatible LLM, Deepgram
+Aura TTS) are used when ``DEEPGRAM_API_KEY`` / ``OPENROUTER_API_KEY`` are
+present. Deterministic mock providers are used otherwise so the test suite
+runs 100% offline without live API credentials.
 
 Barge-in: when a user-speech event arrives while the agent is actively
 streaming TTS, the running speech task is cancelled immediately, a
@@ -162,13 +162,26 @@ class DeepgramLiveSTT(STTProvider):
 # ---------------------------------------------------------------------------
 
 
-class GroqToolLLM(LLMProvider):
-    """Invokes Groq chat completions with tool definitions."""
+# ---------------------------------------------------------------------------
+# Production: OpenAI-compatible LLM (OpenRouter / Groq / etc.)
+# ---------------------------------------------------------------------------
 
-    def __init__(self, api_key: str, model: str = "meta-llama/llama-4-scout-17b-16e-instruct"):
+
+class OpenAILLM(LLMProvider):
+    """OpenAI-compatible chat completions (OpenRouter, Groq, etc.)."""
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "https://openrouter.ai/api/v1/chat/completions",
+        model: str = "nvidia/nemotron-3.5-lightning:free",
+    ):
         self.api_key = api_key
+        base = base_url.rstrip("/")
+        if not base.endswith("/chat/completions"):
+            base = f"{base}/chat/completions"
+        self.base_url = base
         self.model = model
-        self._base_url = "https://api.groq.com/openai/v1/chat/completions"
 
     def _tools(self) -> List[dict]:
         return [
@@ -249,17 +262,23 @@ class GroqToolLLM(LLMProvider):
             {"role": "system", "content": self._system_prompt(state_summary)},
             {"role": "user", "content": transcript},
         ]
-        payload = {
+        payload: dict = {
             "model": self.model,
             "messages": messages,
             "tools": self._tools(),
-            "tool_choice": "required",
+            "tool_choice": "auto",
             "temperature": 0.3,
         }
+        # Nemotron models need chat_template_kwargs to suppress reasoning.
+        if any(k in self.model.lower() for k in ("nemotron", "llama-4-scout")):
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": False,
+                "force_nonempty_content": True,
+            }
         results: List[LLMResult] = []
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
-                self._base_url,
+                self.base_url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 json=payload,
             )
@@ -422,6 +441,7 @@ class VoicePipelineSession:
         self._cancel = False
         self._closed = False
         self._pending_ack: Optional[str] = None
+        self._t_user_speech_end: Optional[float] = None
 
         # Cost tracking (USD).
         self.stt_cost_usd: float = 0.0
@@ -563,6 +583,7 @@ class VoicePipelineSession:
     # ------------------------------------------------------------------ transcript handling
 
     async def _handle_final_transcript(self, transcript: str) -> None:
+        self._t_user_speech_end = time.monotonic()
         await self._send_call(
             TranscriptMessage(
                 role=Role.USER, text=transcript, final=True
@@ -581,11 +602,36 @@ class VoicePipelineSession:
         self.llm_cost_usd += 0.00019 * (len(transcript.split()) / 750.0)
         state.cost_usd = self.stt_cost_usd + self.llm_cost_usd + self.tts_cost_usd
 
+        has_tool = any(r.kind == "tool" for r in results)
+        has_text = any(r.kind == "text" for r in results)
+
         for result in results:
             if result.kind == "tool":
                 await self._execute_tool(result.tool, result.arguments, state)
             elif result.kind == "text":
                 await self._speak(result.text, state)
+
+        # Spoken follow-up if tools were executed without speech and outcome not terminal
+        if has_tool and not has_text and state.outcome is None:
+            missing_spoken = [
+                f for f in [
+                    "incidentDescription", "incidentLocation", "incidentTime",
+                    "injuries", "vehicleDrivable"
+                ]
+                if state.fields.get(f) is None or state.fields.get(f).status != FieldStatus.VALID
+            ]
+            if missing_spoken:
+                prompts = {
+                    "incidentDescription": "Could you describe what happened during the incident?",
+                    "incidentLocation": "Where did this incident occur?",
+                    "incidentTime": "When did this happen?",
+                    "injuries": "Was anyone injured?",
+                    "vehicleDrivable": "Is the vehicle still drivable?",
+                }
+                follow_up = prompts.get(missing_spoken[0], "Got it. What are the next details?")
+            else:
+                follow_up = "Got it! I've sent a card to your chat to complete the next step."
+            await self._speak(follow_up, state)
 
         # After tool/text processing, check for a terminal outcome.
         await self._check_outcome(state)
@@ -695,37 +741,42 @@ class VoicePipelineSession:
 
     async def _stream_tts(self, text: str, state: SessionState) -> None:
         t_first_sent: Optional[float] = None
+        utterance_id = f"agent_{int(time.time() * 1000)}"
+
+        # Emit initial interim transcript once before chunk streaming starts
+        await self._send_call(
+            TranscriptMessage(
+                role=Role.AGENT, id=utterance_id, text=text, final=False
+            ).model_dump_json(by_alias=True, exclude_none=True)
+        )
+
         try:
             async for chunk in self.tts.synthesize(text):
                 if self._cancel:
                     break
                 if t_first_sent is None:
                     t_first_sent = time.monotonic()
+                    ref_time = self._t_user_speech_end if self._t_user_speech_end is not None else t_first_sent
+                    turn_latency_ms = (t_first_sent - ref_time) * 1000
+                    state.latencies_ms.append(round(turn_latency_ms, 2))
+                    self._t_user_speech_end = None
                 b64 = base64.b64encode(chunk).decode("ascii")
                 await self._send_call(
                     AudioMessage(sample_rate=24000, data=b64).model_dump_json(
                         by_alias=True, exclude_none=True
                     )
                 )
-                await self._send_call(
-                    TranscriptMessage(
-                        role=Role.AGENT, text=text, final=False
-                    ).model_dump_json(by_alias=True, exclude_none=True)
-                )
         finally:
             # Mark the transcript final once streaming ends (or is cancelled).
             await self._send_call(
                 TranscriptMessage(
-                    role=Role.AGENT, text=text, final=True
+                    role=Role.AGENT, id=utterance_id, text=text, final=True
                 ).model_dump_json(by_alias=True, exclude_none=True)
             )
-            if t_first_sent is not None:
-                elapsed_ms = (time.monotonic() - t_first_sent) * 1000
-                state.latencies_ms.append(round(elapsed_ms, 2))
-                # TTS cost: ~$0.00001 per character (approximate Deepgram Aura rate).
-                self.tts_cost_usd += len(text) * 0.00001
-                state.cost_usd = self.stt_cost_usd + self.llm_cost_usd + self.tts_cost_usd
-                self.store.save_session(state)
+            # TTS cost: ~$0.00001 per character (approximate Deepgram Aura rate).
+            self.tts_cost_usd += len(text) * 0.00001
+            state.cost_usd = self.stt_cost_usd + self.llm_cost_usd + self.tts_cost_usd
+            self.store.save_session(state)
 
     # ------------------------------------------------------------------ chat card dispatch
 

@@ -333,6 +333,12 @@ def apply_field_update(
         state.updated_at = now_iso
         return True, None, None
 
+    if field == "confirmSubmit" and normalized is False:
+        state.confirm_rejections += 1
+        state.fields[field] = _make_record_field(False, source, FieldStatus.MISSING, now_iso)
+        state.updated_at = now_iso
+        return True, None, None
+
     state.fields[field] = _make_record_field(normalized, source, FieldStatus.VALID, now_iso)
     state.updated_at = now_iso
 
@@ -489,6 +495,13 @@ def evaluate_outcome(
 
     if opt_out_reason:
         return _build_record(state, Outcome.OPTED_OUT, opt_out_reason, now_iso)
+
+    if state.confirm_rejections >= 2:
+        return _build_record(
+            state, Outcome.OPTED_OUT,
+            "User rejected final confirmation twice",
+            now_iso,
+        )
 
     # Immediate trigger: 3 consecutive validation failures on any field.
     for field, count in state.failure_counts.items():

@@ -321,49 +321,64 @@ Triggered when a field already has `status == "valid"` from `source_A` and recei
 
 ---
 
-### Sprint 5: Vision Upload Verification, Rate Limiting, Single-Container Docker & README
+### Sprint 5: Real Provider Wiring, Vision Verification, Rate Limiting, Single-Container Docker & README
 
-**Goal:** Add multimodal photo verification, public-URL rate limiting, single-container production build (`Node 22 -> Python 3.12`), and the complete `README.md`.
+**Goal:** Unify real production providers (OpenRouter/Groq LLM & Vision + Deepgram STT/TTS), add multimodal photo verification with rate-limit fallback, in-memory sliding-window rate limiting, zero-edit runtime-configurable Docker build, and the complete `README.md`.
 
 **Files to Create/Update:**
 
-1. `backend/app/vision.py`:
-* Inspects uploaded damage photo via Groq `meta-llama/llama-4-scout-17b-16e-instruct` (or deterministic local image inspection fallback when `GROQ_API_KEY` is absent/mocked) to verify whether the image depicts a vehicle/damage (`vision_ok: bool, reason: str`), adding vision token cost to `state.cost_usd`.
+1. **Real Provider Wiring (`backend/app/voice.py`, `backend/app/vision.py`, `backend/.env.example`):**
+   * Configurable OpenAI-compatible provider in `voice.py`:
+     * `LLM_BASE_URL` (default `"https://openrouter.ai/api/v1"`, configurable to `"https://api.groq.com/openai/v1"`).
+     * `OPENROUTER_API_KEY` / `LLM_API_KEY` / `GROQ_API_KEY`.
+     * `LLM_MODEL` (default `"nvidia/nemotron-3.5-lightning:free"`, fallback `"google/gemma-4-26b-a4b:free"` or Groq `"meta-llama/llama-4-scout-17b-16e-instruct"`).
+     * `VISION_MODEL` (default `"nvidia/nemotron-3.5-super-vl:free"`).
+     * `DEEPGRAM_API_KEY` for `DeepgramLiveSTT` (`nova-3`, 16kHz linear16) and `DeepgramAuraTTS` (`aura-2-thalia-en`, 24kHz linear16).
+   * For OpenRouter/NVIDIA Nemotron calls, pass `"chat_template_kwargs": {"enable_thinking": False, "force_nonempty_content": True}` so thinking tokens never delay live voice turns.
+   * Deterministic mock providers remain active during `pytest` and whenever API keys are not set, ensuring 100% offline test execution.
 
+2. **Vision Upload Verification (`backend/app/vision.py`):**
+   * `verify_damage_photo(image_bytes: bytes, mime_type: str = "image/png") -> tuple[bool, str, float]`:
+     * Validates image integrity and dimensions using Pillow (`PIL.Image`).
+     * If `OPENROUTER_API_KEY` / `LLM_API_KEY` is configured: sends base64 data URL to `VISION_MODEL` (`nvidia/nemotron-3.5-super-vl:free`) asking for JSON `{"is_vehicle_damage": bool, "reason": str}`.
+     * On upstream rate limits (HTTP 429), timeouts, or missing keys: gracefully falls back to local Pillow image-integrity check so reviewer uploads never crash.
+     * If an upload is explicitly verified as non-vehicle/invalid 2 consecutive times in a session: sets `state.vision_review_flag = True` (escalating `evaluate_outcome` to `needsReview`).
 
-2. `backend/app/rate_limit.py`:
-* In-memory sliding-window rate limiter middleware (default: max 30 new sessions/hour per IP, max 60 file uploads/hour per IP, max 10 minutes of active call audio per session) so public evaluators can test freely while protecting API credits.
+3. **Sliding-Window Rate Limiting (`backend/app/rate_limit.py`):**
+   * In-memory sliding-window per-IP rate limiter middleware:
+     * Limits: max 30 new sessions/hour per IP (`/api/sessions` or initial connect), max 60 uploads/hour per IP (`POST /sessions/{id}/files`), max 10 minutes (600s) active call audio per session.
+     * Returns HTTP 429 `{"detail": "Rate limit exceeded. Please try again later."}` when limits are hit.
+     * Toggleable/bypassed via `RATE_LIMIT_ENABLED=false` or during `pytest`.
 
+4. **Single-Origin Deployment & Dockerfile (CRITICAL `VITE_SERVER_URL` Zero-Edit Fix):**
+   * *Problem:* `starter/src/config.ts` returns `null` if `VITE_SERVER_URL=""`, showing a red "No backend configured" error banner.
+   * *Solution:* In `Dockerfile`, build `starter/` with placeholder `VITE_SERVER_URL="https://__RUNTIME_SERVER_HOST__" npm run build`.
+   * An entrypoint script (`entrypoint.sh`) runs on container startup:
+     ```sh
+     #!/bin/sh
+     TARGET_HOST="${PUBLIC_URL:-http://localhost:8080}"
+     sed -i "s|https://__RUNTIME_SERVER_HOST__|${TARGET_HOST}|g" /app/starter/dist/assets/*.js 2>/dev/null || true
+     exec uvicorn backend.app.main:app --host 0.0.0.0 --port "${PORT:-8080}"
+     ```
+   * In `backend/app/main.py`: Mount `starter/dist` static files at `/` AFTER all API (`/api`, `/sessions`, `/files`) and WebSocket (`/chat`, `/call`) routes so API/WS routes take precedence.
 
-3. `Dockerfile`:
-* **Stage 1 (`node:22-alpine`):** Copies `starter/`, runs `npm ci && VITE_SERVER_URL="" npm run build` to produce `starter/dist`.
-* **Stage 2 (`python:3.12-slim`):** Installs `backend/requirements.txt`, copies `backend/app` and `starter/dist`, mounts `/data` for SQLite WAL + uploads, and runs `uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 1`.
+5. **Comprehensive Technical `README.md`:**
+   * Covers all 10 required sections from `BRIEF.md`:
+     1. Architecture & cross-channel state sharing diagram (Mermaid).
+     2. Final record JSON Schema, field normalization rules, and conflict resolution matrix.
+     3. Outcome state machine (`completed`, `partial`, `optedOut`, `needsReview`) and revision lifecycle ($1 \rightarrow 2$).
+     4. Stack choice & session cost explanation (**strictly <= 150 words**).
+     5. Product decisions made where the brief was open-ended.
+     6. Edge cases handled vs. known limitations.
+     7. Least-trusted component analysis.
+     8. Voice latency (p50/p95 ms) & itemized USD cost breakdown table.
+     9. 1-week production roadmap.
+     10. AI coding assistant reflection (where AI accelerated vs. where it misled, e.g. client-side `pattern` blocking and `VITE_SERVER_URL` empty string behavior).
 
-
-4. `backend/app/main.py`:
-* Mounts compiled `starter/dist` static assets at `/` (when directory exists) so `https://<deployed-host>/` serves the complete React UI and WebSockets from a single origin.
-
-
-5. `README.md`:
-* Covers all 10 required sections from `BRIEF.md`:
-1. Architecture & cross-channel state sharing diagram.
-2. Final record JSON Schema, validation, normalization & conflict resolution rules.
-3. Outcome triggers (`completed`, `partial`, `optedOut`, `needsReview`), delivery, and revision lifecycle (`rev 1 -> rev 2`).
-4. Stack choice & session cost explanation (**strictly <= 150 words**).
-5. Product decisions made where the brief was open-ended.
-6. Edge cases handled vs. known limitations.
-7. Least-trusted component analysis.
-8. Empirical voice latency (`p50` / `p95` ms) & itemized USD cost breakdown table.
-9. Roadmap with another week.
-10. AI coding assistant reflection (where AI helped vs. where it misled, such as client-side `pattern` pre-validation).
-
-
-
-
-6. `backend/tests/test_sprint5.py`
+6. **Sprint 5 Test Suite (`backend/tests/test_sprint5.py`):**
+   * Test vision verification (valid image `vision_ok=True`, invalid non-vehicle image triggers `vision_review_flag` $\rightarrow$ `needsReview`).
+   * Test rate limiter middleware (returns HTTP 429 when threshold exceeded).
+   * Test static asset mount (serves UI without shadowing API/WS routes).
 
 **Sprint 5 Acceptance Gate (`pytest backend/tests/`):**
-
-* Full test suite (`test_sprint1.py` through `test_sprint5.py`) passes 100%.
-* Vision check test: verifies valid vehicle image passes and non-vehicle image increments failure / flags `needsReview`.
-* Rate-limit middleware test: verifies HTTP 429 after exceeding configured threshold.
+* Full test suite (`test_sprint1.py` through `test_sprint5.py`) passes 100% (60+ tests).

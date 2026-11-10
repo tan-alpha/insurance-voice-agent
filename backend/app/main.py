@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 from .protocol import InputResponse
+from .rate_limit import RateLimitMiddleware
 from .session_manager import SessionManager
 from .store import SessionStore
+from .validator import apply_field_update
+from .vision import validate_upload_image
 
 # --------------------------------------------------------------------------- config
 
@@ -51,6 +59,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Rate-limit middleware (disabled via RATE_LIMIT_ENABLED=false or during tests).
+app.add_middleware(RateLimitMiddleware)
 
 store = SessionStore(DB_PATH)
 
@@ -131,6 +142,11 @@ async def upload_file(session_id: str, file: UploadFile = File(...)) -> JSONResp
     dest = _ensure_upload_dir(session_id) / stored_name
     dest.write_bytes(data)
 
+    # Vision verification (Sprint 5).
+    from .vision import validate_upload_image
+
+    vision_ok, vision_reason = await validate_upload_image(data, mime)
+
     url = f"{BASE_URL}/files/{session_id}/{stored_name}"
     store.register_upload(
         session_id=session_id,
@@ -138,9 +154,9 @@ async def upload_file(session_id: str, file: UploadFile = File(...)) -> JSONResp
         url=url,
         mime_type=mime,
         size_bytes=len(data),
-        vision_ok=True,
+        vision_ok=vision_ok,
     )
-    return JSONResponse({"url": url})
+    return JSONResponse({"url": url, "vision_ok": vision_ok, "vision_reason": vision_reason})
 
 
 @app.get("/files/{session_id}/{filename}")
@@ -196,3 +212,15 @@ async def get_telemetry(session_id: str) -> JSONResponse:
             "chat_messages": state.engagement.chat_messages,
         }
     )
+
+
+# --------------------------------------------------------------------------- Static assets (served LAST, after API/WS routes)
+# The starter React UI is built into starter/dist and mounted at / so the
+# single-page app can be served from the same origin as the API. Static file
+# mounting is done AFTER all API/WebSocket routes so those routes take
+# precedence. The Vite build uses a placeholder VITE_SERVER_URL that the
+# entrypoint.sh replaces at runtime with the public URL.
+_starter_dist = Path(__file__).resolve().parent.parent.parent / "starter" / "dist"
+if _starter_dist.is_dir():
+    app.mount("/", StaticFiles(directory=str(_starter_dist), html=True), name="static")
+
