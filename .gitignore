@@ -36,6 +36,9 @@ __pycache__/
 *.db-shm
 *.db-wal
 
+# Runtime data (uploads, sqlite db, etc.)
+data/
+
 # Frontend build artifacts
 starter/node_modules/
 starter/dist/
