@@ -18,3 +18,4 @@ data/
 *.db-wal
 starter/node_modules/
 starter/dist/
+*.mp4
