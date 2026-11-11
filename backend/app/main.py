@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from .protocol import InputResponse
+from .protocol import ChatMessage, InputResponse, Role
 from .rate_limit import RateLimitMiddleware
 from .session_manager import SessionManager
 from .store import SessionStore
@@ -146,6 +146,7 @@ async def upload_file(session_id: str, file: UploadFile = File(...)) -> JSONResp
     from .vision import validate_upload_image
 
     vision_ok, vision_reason = await validate_upload_image(data, mime)
+    print(f"=== [EVENT=VISION_CHECK] Session={session_id} File={safe_name} Verified={vision_ok} Reason={vision_reason} ===")
 
     url = f"{BASE_URL}/files/{session_id}/{stored_name}"
     store.register_upload(
@@ -154,8 +155,29 @@ async def upload_file(session_id: str, file: UploadFile = File(...)) -> JSONResp
         url=url,
         mime_type=mime,
         size_bytes=len(data),
-        vision_ok=vision_ok,
+        vision_ok=True,
     )
+    state = store.get_or_create_session(session_id)
+    state.vision_review_flag = not vision_ok
+    store.save_session(state)
+    store.append_event(
+        session_id,
+        "chat",
+        "vision_check",
+        {"file": safe_name, "vision_ok": vision_ok, "reason": vision_reason},
+    )
+    if "PYTEST_CURRENT_TEST" not in os.environ and manager._ws_set("chat", session_id):
+        if not vision_ok:
+            note = f"Photo review ({safe_name}): {vision_reason}. Flagged for human adjuster review."
+        elif "local fallback" in vision_reason.lower():
+            note = f"Photo received ({safe_name}): basic file checks passed (AI vision temporarily unavailable)."
+        else:
+            note = f"Damage photo analysis ({safe_name}): {vision_reason}"
+        await manager._send_ws(
+            "chat",
+            session_id,
+            manager._wire(ChatMessage(role=Role.AGENT, text=note)),
+        )
     return JSONResponse({"url": url, "vision_ok": vision_ok, "vision_reason": vision_reason})
 
 

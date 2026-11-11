@@ -22,7 +22,7 @@ export function App() {
 
   return (
     <>
-      <Header call={state.call} notice={state.notice} onCall={onCall} />
+      <Header call={state.call} notice={state.notice} onCall={onCall} onNewChat={config.startFreshSession} />
       <Thread
         serverLabel={config.serverLabel}
         sessionId={config.sessionId}

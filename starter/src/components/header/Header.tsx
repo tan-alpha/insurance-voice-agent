@@ -1,5 +1,5 @@
 import { isInCall, type CallStatus } from "../../state/conversation";
-import { AvatarIcon, PhoneIcon } from "../icons";
+import { AvatarIcon, PhoneIcon, PlusIcon } from "../icons";
 import { CallTimer } from "./CallTimer";
 import { MicMeter } from "./MicMeter";
 
@@ -7,9 +7,10 @@ interface Props {
   call: CallStatus;
   notice: string | null;
   onCall: () => void;
+  onNewChat: () => void;
 }
 
-export function Header({ call, notice, onCall }: Props) {
+export function Header({ call, notice, onCall, onNewChat }: Props) {
   const inCall = isInCall(call.state);
   return (
     <>
@@ -31,6 +32,17 @@ export function Header({ call, notice, onCall }: Props) {
           onClick={onCall}
         >
           <PhoneIcon />
+        </button>
+        <button
+          className="new-chat-btn"
+          type="button"
+          aria-label="New chat"
+          title={inCall ? "End the call to start a new chat" : "Start a fresh chat session"}
+          disabled={inCall}
+          onClick={onNewChat}
+        >
+          <PlusIcon />
+          <span>New chat</span>
         </button>
         <MicMeter />
       </header>

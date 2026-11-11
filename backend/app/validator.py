@@ -228,7 +228,7 @@ def validate_field(
         return True, normalized, None
 
     if field == "injuries":
-        v = _collapse_whitespace(str(raw_value)).strip().lower()
+        v = _collapse_whitespace(str(raw_value)).strip().lower().rstrip(".!?,")
         none_tokens = {
             "no", "none", "no one hurt", "nobody", "nobody was hurt",
             "no one was hurt", "no injuries", "no injury", "not hurt",
@@ -237,7 +237,7 @@ def validate_field(
         }
         if v in none_tokens:
             return True, "none", None
-        if any(v.startswith(p) for p in ("no ", "none", "nobody", "no one", "no injury", "not injured")):
+        if any(v.startswith(p) for p in ("no ", "no.", "no,", "none", "nobody", "no one", "no injury", "not injured")):
             if not any(inj in v for inj in ("broken", "bleed", "fracture", "pain", "hospital", "whiplash", "concussion", "hurt my", "injured my")):
                 return True, "none", None
         if len(v) >= 3:
@@ -247,7 +247,7 @@ def validate_field(
     if field == "vehicleDrivable":
         if isinstance(raw_value, bool):
             return True, raw_value, None
-        v = _collapse_whitespace(str(raw_value)).strip().lower()
+        v = _collapse_whitespace(str(raw_value)).strip().lower().rstrip(".!?,")
         true_tokens = {
             "yes", "true", "drivable", "car is drivable", "it is drivable",
             "it's drivable", "driveable", "yes drivable", "yes it is", "car works",
@@ -594,6 +594,14 @@ def evaluate_outcome(
         return _build_record(
             state, Outcome.NEEDS_REVIEW,
             "Bodily injury reported; requires human adjuster review",
+            now_iso,
+        )
+
+    if all_required_valid and confirm_ok and email_ok and state.vision_review_flag:
+        return _build_record(
+            state,
+            Outcome.NEEDS_REVIEW,
+            "Uploaded photo flagged by AI vision for human adjuster review",
             now_iso,
         )
 

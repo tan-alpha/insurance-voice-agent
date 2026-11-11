@@ -48,6 +48,15 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .call-btn.hangup { background: var(--danger); }
 .call-btn.hangup svg { transform: rotate(135deg); }
 .call-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.new-chat-btn {
+  flex: none; height: 32px; padding: 0 10px; border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.35); background: rgba(255, 255, 255, 0.12);
+  color: var(--header-text); font: inherit; font-size: 12.5px; font-weight: 500;
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; cursor: pointer;
+}
+.new-chat-btn svg { width: 14px; height: 14px; flex: none; }
+.new-chat-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.22); }
+.new-chat-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .meter { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; }
 .meter span { display: block; height: 100%; width: 0; background: rgba(255, 255, 255, 0.6); }

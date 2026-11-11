@@ -10,7 +10,7 @@ Full-duplex voice and web chat agent built for motor insurance claim intake. The
 
 ```mermaid
 graph LR
-    subgraph Browser ["Browser Client (Unmodified starter/)"]
+    subgraph Browser ["Browser Client (React + Web Audio UI)"]
         Mic["16 kHz PCM16 Mic + 24 kHz AudioContext"]
         Cards["Chat Thread & Input Cards"]
     end
@@ -26,10 +26,10 @@ graph LR
     end
 
     subgraph Providers ["External AI & Webhook Endpoints"]
-        DG_STT["Deepgram Nova-3 Live STT"]
-        LLM["OpenRouter / Groq Tool LLM"]
+        DG_STT["Deepgram Nova-3 Live STT (endpointing=500)"]
+        LLM["Cohere North Mini + Tool Guards"]
         DG_TTS["Deepgram Aura-2 24 kHz TTS"]
-        Vision["Nemotron Super VL + Pillow Fallback"]
+        Vision["Nemotron 3 Nano Omni + Pillow Fallback"]
         Sink["Webhook Sink (POST)"]
     end
 
@@ -53,10 +53,18 @@ graph LR
 ### How State Is Shared Across Channels
 Both `WS /call?sessionId={id}` and `WS /chat?sessionId={id}` attach to a centralized `SessionManager` backed by a SQLite database in Write-Ahead Logging (`WAL`) mode (`backend/app/store.py`). Every mutation acquires a per-session `asyncio.Lock` and commits atomically to disk before emitting wire events:
 
-1. **Call $\rightarrow$ Chat Card Dispatch:** As the user provides conversational details on the call (`incidentDescription`, `incidentLocation`, `incidentTime`, `injuries`, `vehicleDrivable`), the LLM invokes `record_spoken_fields`. Once validated, the backend automatically dispatches structured `inputRequest` cards (`policyNumber`, `vehicleType`, `email`, `damagePhotos`, `confirmSubmit`) over `/chat` one at a time.
+1. **Call $\rightarrow$ Chat Card Dispatch (Sequenced Handoff):** As the user speaks on the call (`incidentDescription`, `incidentLocation`, `incidentTime`, `injuries`, `vehicleDrivable`), `cohere/north-mini-code:free` invokes `record_spoken_fields`. While all 5 spoken fields are still being collected, structured chat cards (`policyNumber`, `vehicleType`, `email`, `damagePhotos`, `confirmSubmit`) are held in `next_missing_input_request(call_active=True)`. Once all 5 spoken fields validate, `VoicePipelineSession` enters `_closing_handoff`, finishes streaming and draining the full goodbye audio playback (`_last_tts_bytes / 48000.0 - _last_tts_play_elapsed_s + 1.5s`) before closing `/call`, and then dispatches the first structured chat card so the user finishes cleanly in chat.
 2. **Chat $\rightarrow$ Call Live Acknowledgment:** When the user submits a chat card during an active call, `handle_chat_message` validates the value, persists it with `source="chat"`, dispatches the next chat card, and notifies the active `VoicePipelineSession`. If the voice agent is idle, it immediately speaks a confirmation (e.g., *"Got your policy number POL-123456. I've sent the vehicle selector to your chat."*); if the agent is mid-turn, the acknowledgment is queued and spoken as soon as the turn finishes.
 3. **Spoken Input Cancels Open Chat Card (`inputCancel`):** If an optional card (`email`) or `policyNumber` is open in `/chat` and the user speaks a valid value on `/call`, the backend persists the spoken value and emits `{"type": "inputCancel", "requestId": "req_email", "reason": "given on the call"}` over `/chat` to dismiss the card.
 4. **Call Hang-Up $\rightarrow$ Chat Continuation & Call Resume:** When `/call` disconnects before completion, `_nudge_chat_after_call` sends a transition message on `/chat` and dispatches `inputRequest` cards for any remaining spoken or chat fields. If the user clicks **Call** again later, `speak_context_greeting` summarizes already-collected fields from SQLite and resumes without repeating answered questions.
+
+### LLM-Driven Conversation Without Over-Determinism
+A common pitfall with tool-calling voice agents is either trusting small free-tier LLMs blindly (causing overwritten fields or hallucinated `"none"` / `true` defaults) or replacing the LLM with a rigid script. We kept the conversation **genuinely LLM-driven** (`cohere/north-mini-code:free`, `temperature=0.0`, 10-turn rolling context) while adding narrow safety guards in [`backend/app/voice.py`](backend/app/voice.py):
+* **Natural Turn Order & Multi-Field Capture:** Callers can give details in any order, combine multiple facts in one sentence, ask clarifying questions, or pause mid-thought (`endpointing=500`, `utterance_end_ms=1000` on Deepgram Nova-3).
+* **Malformed Tool JSON Recovery (`_parse_tool_args`):** Repairs duplicate commas (`,,`) or stray brackets emitted by small models instead of dropping extracted arguments.
+* **Grounded Field Extraction (`_is_spoken_field_grounded`) & Overwrite Lock:** Prevents unmentioned `injuries` or `vehicleDrivable` guesses and locks already-valid `source="call"` fields while moving on — while **still allowing legitimate updates** when `last_prompt` explicitly targeted that field or the user uses correction phrasing (`"actually"`, `"correction"`, `"sorry"`, `"meant to say"`, `"instead"`, `"change my"`, `"wrong"`).
+* **Question-Reactive Recovery (`_recover_direct_prompt_answer`):** Never enforces a fixed question order; activates *only* when the assistant's immediate `last_prompt` explicitly asked about `vehicleDrivable` or `injuries`, the model omitted the tool call on a short direct answer (e.g., `"Yes."`), and `validate_field()` cleanly validates it.
+* **Fast Vision Check & Actionable Review Notes:** [`backend/app/vision.py`](backend/app/vision.py) downscales uploads (`MAX_IMAGE_DIM=512`), JPEG-encodes (`quality=85`), disables reasoning tokens (`reasoning={"effort": "none"}`) on `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` over a pooled HTTP client, posts a brief damage assessment directly into `/chat`, and degrades cleanly to local Pillow checks on upstream timeout/`429`. When a claim escalates to `needsReview` (bodily injury or 3-strike validation failure), `_maybe_send_needs_review_note` posts a plain explanation alongside `FinalRecord`.
 
 ---
 
@@ -138,21 +146,21 @@ When a field already has `status == "valid"` from `source_A` and receives a new 
 
 ## 4. Stack Choice & Session Cost ($\le 150$ Words)
 
-We built the backend on Python FastAPI and SQLite (`WAL` mode) with Deepgram Nova-3 for 16 kHz streaming STT, Deepgram Aura-2 (`aura-2-thalia-en`) for 24 kHz streaming PCM16 TTS, and an OpenAI-compatible tool-calling layer supporting OpenRouter (`nvidia/nemotron-3.5-lightning:free`, `nvidia/nemotron-3.5-super-vl:free`) and Groq (`llama-4-scout-17b-16e-instruct`). Deepgram accepts the browser’s raw 16 kHz PCM16 frames and emits raw 24 kHz PCM16 audio directly, eliminating server-side ffmpeg transcoding overhead and keeping barge-in cancellation under 50 ms.
+We built the backend on Python FastAPI and SQLite (`WAL` mode) with Deepgram Nova-3 (`endpointing=500`) for 16 kHz streaming STT, Deepgram Aura-2 (`aura-2-thalia-en`) for 24 kHz streaming PCM16 TTS, OpenRouter (`cohere/north-mini-code:free`) for natural tool-calling voice turns, and `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` (`effort="none"`, `MAX_IMAGE_DIM=512`) with Pillow fallback for damage-photo validation. Streaming raw PCM16 frames directly between browser and Deepgram eliminates server-side transcoding and preserves instant barge-in.
 
-A completed 2-minute session (~90s active speech, ~600 TTS characters, ~1,500 LLM tokens, 1 photo check) costs **$0.015–$0.017** at list rates:
-* **Deepgram Nova-3 STT:** $0.0043/min $\times 1.5\text{ min} = \$0.0065$
-* **Deepgram Aura-2 TTS:** $0.015/1\text{K chars} \times 600 = \$0.0090$
-* **LLM + Vision Inference:** $0.0000 (OpenRouter free tier) to $0.0013 (Groq)
+Out-of-pocket spend during development and live testing was **$0.00** using Deepgram free-tier credits and OpenRouter `:free` models. Based on live session telemetry (`state.cost_usd`) across verified ~49–63s calls:
+* **Tracked Live Cost (~49–63s calls):** **`$0.0034–$0.0040`** per session (`$0.00` actual spend on free tiers)
+* **Deepgram List Estimate (90s speech, 600 TTS chars):** **~$0.0155** (`$0.0065` STT + `$0.0090` TTS)
+* **LLM + Vision (`:free`):** **$0.0000**
 
-*(136 words)*
+*(133 words)*
 
 ---
 
 ## 5. Product Decisions Where the Brief Was Open-Ended
 
-1. **Collecting Full Context Before Escalating Bodily Injury (`needsReview`):** When a claimant reports an injury (`injuries != "none"`), aborting the call immediately forces a human adjuster to cold-call the user for basic policy and photo details. Instead, our agent flags `injury_review_flag = True`, collects all 8 required fields + confirmation, and then routes the completed packet to `needsReview`.
-2. **Sequential Card Pacing During Voice Calls:** Rather than overwhelming a caller on a phone screen by rendering all 4 chat cards at second zero, `next_missing_input_request(call_active=True)` holds chat cards until the 5 conversational fields are captured on the call, then dispatches structured cards one at a time.
+1. **Collecting Full Context Before Escalating Bodily Injury (`needsReview`):** When a claimant reports an injury (`injuries != "none"`), aborting the call immediately forces a human adjuster to cold-call the user for basic policy and photo details. Instead, our agent flags `injury_review_flag = True`, collects all 8 required fields + confirmation, emits a clear `/chat` explanation note (`_maybe_send_needs_review_note`), and routes the completed packet to `needsReview`.
+2. **Sequential Card Pacing During Voice Calls:** Rather than overwhelming a caller on a phone screen by rendering all chat cards at second zero, `next_missing_input_request(call_active=True)` holds structured cards until the 5 conversational fields are captured on the call, then plays the full goodbye message before closing `/call` and dispatching structured cards one at a time.
 3. **Bypassing Browser Regex Blocking to Enforce Server-Side 3-Strike Escalation:** Auditing `starter/src/components/cards/Composer.tsx` and `answers.ts` revealed that setting `InputRequest.pattern` causes the browser to block invalid submissions locally before sending them over `/chat`. We intentionally omit `pattern` on `InputRequest` payloads so malformed inputs (e.g., `"POL-123"`) reach FastAPI, allowing deterministic server validation, `inputError` card re-opening, and 3-strike `needsReview` escalation.
 4. **Configurable 120-Second `partial` Timeout:** Set via `PARTIAL_TIMEOUT_SECONDS=120` so reviewers can observe the `partial` (`revision: 1`) $\rightarrow$ `completed` (`revision: 2`) upgrade without waiting 30 minutes.
 
@@ -162,9 +170,11 @@ A completed 2-minute session (~90s active speech, ~600 TTS characters, ~1,500 LL
 
 ### Edge Cases Handled
 * **Server Restart Mid-Session:** All state, open card specs (`open_request`), failure counters, and revision watermarks live in SQLite WAL. Restarting `uvicorn` mid-session and refreshing the browser resumes on the exact pending field without re-asking prior fields or double-delivering webhooks.
-* **Mid-Sentence Barge-In:** Deepgram `SpeechStarted` events immediately cancel the active TTS `asyncio.Task` and emit `{"type": "stopPlayback"}` on `/call`, halting browser `AudioBufferSourceNode` playback with zero trailing audio chunks.
+* **Non-Clipping Call Handoff:** `_finish_call_after_speech` calculates remaining client buffer duration from streamed 24 kHz PCM bytes minus `_last_tts_play_elapsed_s` plus a `1.5s` safety buffer so the goodbye message finishes playing completely before `/call` closes and chat cards begin.
+* **Mid-Sentence Barge-In:** Deepgram `SpeechStarted` events cancel active non-closing TTS `asyncio.Task`s and emit `{"type": "stopPlayback"}` on `/call`, halting browser playback immediately.
+* **Small-Model Tool Quirks & Spoken Punctuation:** `_parse_tool_args` repairs minor JSON syntax glitches (`,,`, trailing brackets), `_is_spoken_field_grounded` + overwrite locks prevent hallucinated defaults or accidental field clobbering while still allowing spoken corrections, `_recover_direct_prompt_answer` catches dropped direct `"Yes."` / injury answers to an explicit assistant prompt without enforcing fixed turn order, and `validator.py` strips trailing ASR punctuation (`.!?,`) on yes/no responses.
 * **Cross-Channel Concurrency Races:** Guarded by per-session `asyncio.Lock` instances in `SessionManager` so simultaneous `/call` tool updates, `/chat` submissions, and watchdog ticks never clobber state.
-* **Fake Image Uploads & Upstream Vision 429s:** `POST /sessions/{id}/files` validates PNG/JPEG/WEBP/GIF magic bytes before touching disk. If the upstream free-tier vision API returns `HTTP 429` or times out, `vision.py` degrades gracefully to local Pillow image verification so user uploads are never blocked.
+* **Fake Image Uploads & Upstream Vision 429s:** `POST /sessions/{id}/files` validates PNG/JPEG/WEBP/GIF magic bytes before touching disk. Images are downscaled (`MAX_IMAGE_DIM=512`), JPEG-encoded, and checked via `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` (`reasoning={"effort": "none"}`); if upstream returns `HTTP 429` or times out, [`vision.py`](backend/app/vision.py) degrades gracefully to local Pillow image verification so user uploads are never blocked.
 
 ### Known Limitations
 * **Single-Node Process Locks & Rate Limiter:** Per-session `asyncio.Lock` objects and the IP sliding-window rate limiter reside in process memory (`--workers 1`). Horizontal multi-replica scaling would require Redis locks and counters.
@@ -175,45 +185,53 @@ A completed 2-minute session (~90s active speech, ~600 TTS characters, ~1,500 LL
 
 ## 7. What in Our Own System We Trust Least (and Why)
 
-1. **VAD Hair-Trigger Barge-In in Noisy Environments (`backend/app/voice.py`):**
-   * *Why:* `_handle_barge_in()` triggers immediately on Deepgram's `SpeechStarted` event to achieve sub-50ms interruption. In a noisy room (traffic, cough, speakerphone echo), a transient acoustic spike can fire `SpeechStarted` without actual words, truncating the agent's TTS output prematurely.
-   * *Mitigation:* Barge-in only fires when `_agent_speaking` is true, and the cancelled turn's text remains visible in the live transcript thread.
-2. **Upstream Free-Tier LLM Jitter & Tool Formatting (`backend/app/voice.py`):**
-   * *Why:* Free-tier model routers (`openrouter.ai`) experience variable queue depth (jumping from 250 ms to 2.5 s TTFT during peak load) and occasionally return tool calls with empty `content`.
-   * *Mitigation:* The LLM never mutates state directly—all tool arguments pass through `validator.py`. We also pass `chat_template_kwargs: {"enable_thinking": False}` to suppress `<think>` token delays and generate a deterministic spoken follow-up whenever the model emits a tool call without conversational text.
-3. **Regex-Based Natural Time Normalization (`backend/app/validator.py`):**
-   * *Why:* Spoken timestamps are unconstrained. If the LLM passes a raw colloquial phrase that doesn't match `_parse_incident_time()` patterns, validation rejects it and increments `failure_counts`.
+1. **Free-Tier LLM Router Queue Jitter & Dropped Tool Calls (`backend/app/voice.py`):**
+   * *Why:* Free OpenRouter endpoints share public queue capacity. Benchmarking `nvidia/nemotron-3.5-lightning:free` showed heavy latency spikes with `effort="minimal"`/`"low"` and dropped tool calls when reasoning was disabled (`effort="none"`), while `cohere/north-mini-code:free` performs much faster (~0.7–2.1s LLM inference) yet can still occasionally experience upstream queue jitter (~3–4s total turn latency) or omit a tool call on a terse `"Yes."` answer.
+   * *Mitigation:* Temperature `0.0`, pooled keep-alive `httpx.AsyncClient`, `_parse_tool_args`, `_is_spoken_field_grounded`, and question-reactive `_recover_direct_prompt_answer` keep extraction reliable without hardcoding conversation order.
+2. **Free-Tier Vision Latency & Rate Limits (`backend/app/vision.py`):**
+   * *Why:* Sending full-resolution phone images to reasoning-enabled VL models originally caused long stalls; upstream `:free` rate limits (`HTTP 429`) can also occur under burst load.
+   * *Mitigation:* Downscaling to `MAX_IMAGE_DIM=512` JPEG with `reasoning={"effort": "none"}` cut real damage-photo verification to ~1.9s, backed by deterministic Pillow fallback so uploads never hang.
+3. **VAD Sensitivity vs. Turn Endpointing (`backend/app/voice.py`):**
+   * *Why:* Using Deepgram `endpointing=500` avoids cutting callers off mid-thought while keeping `SpeechStarted` barge-in fast, but without headphones acoustic echo/noise spikes can still fire false barge-ins while the agent is speaking.
+   * *Mitigation:* Barge-in is disabled during `_closing_handoff`, and cancelled turn text remains visible in the transcript thread.
+4. **Regex-Based Natural Time Normalization (`backend/app/validator.py`):**
+   * *Why:* Spoken timestamps are unconstrained; unusual phrasing that falls outside `_parse_incident_time()` patterns triggers a validation prompt and increments `failure_counts`.
 
 ---
 
-## 8. Voice Latency & Cost Measurements
+## 8. Voice Latency, Vision Latency & Cost Measurements
 
-### Voice Latency (`p50` and `p95`)
-Measured in `VoicePipelineSession` (`backend/app/voice.py`) from the timestamp Deepgram finalizes user speech (`_t_user_speech_end` at the start of `_handle_final_transcript`) to the timestamp the first 24 kHz PCM16 `AudioMessage` chunk is written to `/call` (`t_first_sent`), exposed per session at `GET /sessions/{sessionId}/telemetry`:
+### Live End-to-End Measurements (OpenRouter `:free` + Deepgram Free Tier)
+Measured in [`VoicePipelineSession`](backend/app/voice.py) from finalized user speech (`_t_user_speech_end` in `_handle_final_transcript`) to the first 24 kHz PCM16 chunk written to `/call` (`t_first_sent`), across **17 conversational turns** from 3 live end-to-end voice+chat calls (`sessions.db`, excluding the initial `0.0 ms` welcome greeting):
 
-| Stage | p50 (Groq LPU) | p95 (Groq LPU) | p50 (OpenRouter Free) | p95 (OpenRouter Free) |
-|---|---|---|---|---|
-| **Deepgram Nova-3 Endpointing** | 300 ms | 350 ms | 300 ms | 350 ms |
-| **LLM Tool + Text TTFT** | 210 ms | 380 ms | 520 ms | 1,450 ms |
-| **Deepgram Aura-2 First Chunk** | 160 ms | 240 ms | 160 ms | 240 ms |
-| **Measured Server Turn Latency (`_t_user_speech_end -> t_first_sent`)** | **~370 ms** | **~620 ms** | **~680 ms** | **~1,690 ms** |
-| **Perceived End-to-End Latency (incl. 300 ms VAD silence window)** | **~670 ms** | **~970 ms** | **~980 ms** | **~2,040 ms** |
+| Metric | Observed Measurement | Notes / Scope |
+|---|---|---|
+| **Measured Voice Turn `p50` (`_t_user_speech_end` $\rightarrow$ `t_first_sent`)** | **2,142 ms** | Across 17 user turns (range `1,151 ms` – `3,949 ms`) |
+| **Measured Voice Turn `p95`** | **2,964 ms – 3,949 ms** | Queue spikes on OpenRouter `:free` dominate tail latency |
+| **LLM Inference (`cohere/north-mini-code:free`)** | **729 – 2,098 ms** | Observed per-turn `[TIMING]` logs (`llm_ms`) |
+| **Deepgram Aura-2 TTS First Chunk (`aura-2-thalia-en`)** | **372 – 920 ms** | Observed per-turn `[TIMING]` logs (`tts_first_ms`) |
+| **Vision Photo Check (`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`)** | **1,939 ms** (`679 ms` negative) | `MAX_IMAGE_DIM=512`, JPEG, `reasoning={"effort": "none"}` |
+| **Offline Automated Test Suite (`pytest backend/tests/ -v`)** | **69 passed in 1.30s** | Uses offline mock STT/LLM/TTS + Pillow fallback |
+
+*(Note: Adding Deepgram's `endpointing=500` silence threshold puts perceived end-to-end latency at ~2.6s median; switching `LLM_BASE_URL` / `LLM_MODEL` to a dedicated low-latency endpoint such as paid Groq/OpenRouter tiers drops LLM TTFT substantially without changing backend code.)*
 
 ### Cost Calculation Breakdown
 Tracked live in `state.cost_usd` (`GET /sessions/{sessionId}/telemetry`):
-* **STT:** $\$0.0043/\text{min}$ (`nova-3` streaming) $\approx \$0.0065$ per 90s call.
-* **TTS:** $\$0.015/1\text{K chars}$ (`aura-2`) $\approx \$0.0090$ per 600 spoken characters.
-* **LLM + Vision:** $\$0.0000$ on OpenRouter `:free` models (or $\approx \$0.0003$ LLM + $\$0.0010$ Vision on paid Groq/OpenRouter tiers).
-* **Total Completed Session Cost:** **$\$0.0155\text{ – }\$0.0168$**.
+* **Actual Out-of-Pocket Cost:** **`$0.00`** (built and validated entirely on OpenRouter `:free` models and Deepgram free-tier credits).
+* **Tracked Meter Estimate (`49s–63s` live completed/review calls):** **`$0.0034–$0.0040`** per session.
+* **Standard List-Rate Ceiling (90s speech, 600 TTS chars):** **~$0.0155** (`$0.0065` STT + `$0.0090` TTS + `$0.00` `:free` LLM/Vision).
 
 ---
 
 ## 9. What We Would Do Next With Another Week
 
-1. **Token-Level Sentence Streaming into WebSocket TTS:** Stream LLM text tokens through a sentence-boundary buffer directly into Deepgram's persistent WebSocket TTS endpoint to shave ~150–250 ms off `p95` voice latency on multi-sentence responses.
-2. **Acoustic Barge-In Debouncing:** Require either $\ge 150\text{ ms}$ of sustained VAD speech energy or a non-empty interim word token before firing `stopPlayback`, eliminating false interruptions from background noise.
-3. **Multilingual Code-Switching (English + Hindi + Kannada):** Enable Deepgram `multi` language detection and dynamic Aura/Indic TTS voice switching mid-call.
-4. **Redis-Backed Distributed State & Locks:** Move per-session locks and rate-limit sliding windows to Redis for multi-worker horizontal scaling.
+> This working prototype was completed in roughly **1.5 days** using only free-tier models and APIs (**$0.00 spent out of pocket**). It already delivers a genuine, non-rigid voice + chat claims flow end to end, and can be made significantly more stable, lower-latency, and even smoother for end users going forward:
+
+1. **Dedicated Low-Latency Inference Tiers:** Move off shared `:free` model queues to dedicated Groq / low-latency OpenRouter endpoints so voice turn `p95` drops reliably under `1,000 ms` and tool calls never experience router stalls.
+2. **Token-Level Sentence Streaming into WebSocket TTS:** Stream LLM text tokens through a sentence-boundary buffer directly into Deepgram's persistent WebSocket TTS endpoint to shave another ~200–400 ms off voice response time.
+3. **Interactive Chat Repair & Polish UX:** Let users edit previously submitted spoken/chat fields directly via inline edit pills in chat without needing to restart or phrase spoken corrections manually, plus show richer photo-upload progress feedback while vision runs.
+4. **Acoustic Barge-In Debouncing:** Require either $\ge 150\text{ ms}$ of sustained VAD energy or a non-empty interim word token before firing `stopPlayback`, eliminating accidental background-noise interruptions when speakers aren't wearing headphones.
+5. **Multilingual Code-Switching & Redis-Backed Scaling:** Enable Deepgram `multi` detection with regional TTS voice switching, and move per-session locks and rate limits to Redis for multi-worker horizontal scaling.
 
 ---
 
@@ -221,11 +239,12 @@ Tracked live in `state.cost_usd` (`GET /sessions/{sessionId}/telemetry`):
 
 * **Where AI Helped:**
   * Rapidly translating `starter/src/protocol/types.ts` and `enums.ts` into strict Pydantic v2 models (`ConfigDict(populate_by_name=True, extra="forbid")`) with 1:1 camelCase wire serialization.
-  * Scaffolding the offline mock provider harness (`MockSTTProvider`, `MockLLMProvider`, `MockTTSProvider`), allowing 60+ unit and integration tests (covering barge-in, 3-strike escalation, restart recovery, and `revision: 1 -> 2` upgrades) to run deterministically in `<2s` without burning API credits.
-* **Where AI Misled (and Had to Be Corrected):**
-  1. **Client-Side `pattern` Trap:** The coding assistant initially copied `pattern="^POL-[0-9]{6}$"` from `demo/script.ts` into the server's `InputRequest`. Inspecting `Composer.tsx` and `answers.ts#L50` showed that `starter/` blocks pattern mismatches in the browser before they ever reach the WebSocket, which silently broke server-side `inputError` testing and 3-strike `needsReview` escalation. I forced `pattern=None` on server-dispatched requests.
-  2. **`VITE_SERVER_URL=""` Empty-String Trap:** For the single-container Docker build, the assistant suggested building Vite with `VITE_SERVER_URL=""`. Checking `starter/src/config.ts#L10` (`if (!raw) return null;`) proved an empty string triggers the *"No backend configured"* error banner. We solved this without touching `starter/` by compiling a placeholder URL (`https://__RUNTIME_SERVER_HOST__`) and substituting `${PUBLIC_URL}` at container boot in `docker/entrypoint.sh`.
-  3. **Reasoning Model Dead-Air on Voice Turns:** Default OpenRouter configurations emitted `<think>` blocks before tool calls, adding 3–6 seconds of silence on voice turns until we injected `chat_template_kwargs: {"enable_thinking": False, "force_nonempty_content": True}`.
+  * Scaffolding the offline mock provider harness (`MockSTTProvider`, `MockLLMProvider`, `MockTTSProvider`), enabling `69` automated unit and integration tests (covering barge-in, 3-strike escalation, restart recovery, vision checks, and `revision: 1 -> 2` upgrades) to run deterministically in ~1.3s.
+* **Where AI Misled (and Had to Be Verified Live):**
+  1. **Assuming `:free` Reasoning Models Support Zero-Overhead Tool Calling Out of the Box:** Testing live against OpenRouter proved `nvidia/nemotron-3.5-lightning:free` still ran reasoning stalls under `effort="minimal"`/`"low"` and dropped tool calls under `effort="none"`. Benchmarking live turns led us to switch to `cohere/north-mini-code:free` and add narrow question-reactive recovery (`_recover_direct_prompt_answer`) rather than guessing flags blindly.
+  2. **Client-Side `pattern` Trap:** Auditing `starter/src/components/cards/Composer.tsx` and `answers.ts#L50` showed that setting `pattern` on `InputRequest` blocks invalid submissions in the browser before they reach `/chat`, silently breaking server-side 3-strike `needsReview` escalation. Omitting `pattern` on server requests keeps validation server-authoritative.
+  3. **`VITE_SERVER_URL=""` Empty-String Trap:** `starter/src/config.ts#L10` (`if (!raw) return null;`) treats an empty build string as *"No backend configured"*. Compiling a placeholder URL (`https://__RUNTIME_SERVER_HOST__`) and substituting `${PUBLIC_URL}` at container boot in `docker/entrypoint.sh` cleanly avoids hardcoding hosts at build time.
+  4. **Premature Audio Hangup Cutoff:** Closing `/call` immediately when all 5 spoken fields validated caused client playback audio to truncate mid-goodbye; computing remaining PCM duration (`_last_tts_bytes / 48000.0 - _last_tts_play_elapsed_s + 1.5s`) before closing fixed the handoff cleanly.
 
 ---
 
@@ -236,14 +255,17 @@ Tracked live in `state.cost_usd` (`GET /sessions/{sessionId}/telemetry`):
 # 1. Backend setup (from repository root)
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
-cp backend/.env.example .env
-# Add DEEPGRAM_API_KEY and OPENROUTER_API_KEY (or GROQ_API_KEY) to .env
-uvicorn backend.app.main:app --host 0.0.0.0 --port 8080 --reload
+cp backend/.env.example backend/.env
+# Add DEEPGRAM_API_KEY and OPENROUTER_API_KEY (or GROQ_API_KEY) to backend/.env
+PYTHONPATH=. uvicorn backend.app.main:app --host 0.0.0.0 --port 8080
 
-# 2. Frontend setup (in a second terminal)
+# 2. Frontend build (single-origin served by FastAPI at http://localhost:8080)
 cd starter
-cp .env.example .env.local   # Sets VITE_SERVER_URL=http://localhost:8080
 npm install
+VITE_SERVER_URL=http://localhost:8080 npm run build
+
+# Or run Vite dev server separately in a second terminal:
+cp .env.example .env.local   # Sets VITE_SERVER_URL=http://localhost:8080
 npm run dev                  # Open http://localhost:5173
 ```
 
@@ -251,17 +273,19 @@ npm run dev                  # Open http://localhost:5173
 ```bash
 docker build -t voice-chat-agent .
 docker run --rm -p 8080:8080 \
-  -e PUBLIC_URL=http://localhost:8080 \
-  -e BASE_URL=http://localhost:8080 \
+  -e PUBLIC_URL=https://<your-deployed-host> \
+  -e BASE_URL=https://<your-deployed-host> \
   -e DEEPGRAM_API_KEY=your_key \
   -e OPENROUTER_API_KEY=your_key \
+  -e LLM_MODEL=cohere/north-mini-code:free \
+  -e VISION_MODEL=nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free \
   voice-chat-agent
-# Open http://localhost:8080
+# For local Docker testing, use http://localhost:8080 for PUBLIC_URL and BASE_URL
 ```
 
 ### Run Offline Automated Test Suite
 ```bash
-pytest backend/tests/ -v
+python -m pytest backend/tests/ -v
 ```
 
 ### HTTP Inspection & Testing Endpoints

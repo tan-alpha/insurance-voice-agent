@@ -40,6 +40,13 @@ function describeSetupProblem(): string | null {
     : "No backend configured. Set VITE_SERVER_URL in .env.local (see .env.example) and restart npm run dev to connect to your server, or open ?demo=1 to see the intended flow.";
 }
 
+export function startFreshSession(): void {
+  const next = new URLSearchParams(location.search);
+  next.delete("sessionId");
+  const qs = next.toString();
+  location.assign(qs ? `${location.pathname}?${qs}` : location.pathname);
+}
+
 const params = new URLSearchParams(location.search);
 const pace = Number(params.get("pace"));
 const rawServer = import.meta.env.VITE_SERVER_URL?.trim() ?? "";

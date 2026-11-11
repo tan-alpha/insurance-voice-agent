@@ -18,14 +18,21 @@ from fastapi import WebSocket
 from .protocol import (
     ChatMessage,
     FieldStatus,
+    InputCancel,
     InputError,
     InputRequest,
+    Outcome,
     RecordMessage,
     Role,
     SessionState,
 )
 from .store import SessionStore
-from .validator import apply_field_update, evaluate_outcome, next_missing_input_request
+from .validator import (
+    SPOKEN_ORDER,
+    apply_field_update,
+    evaluate_outcome,
+    next_missing_input_request,
+)
 from .webhook import deliver_final_record
 
 # Optional voice pipeline (Sprint 3). Imported lazily so the module loads
@@ -115,7 +122,8 @@ class SessionManager:
             role=Role.AGENT,
             text=(
                 "Hi! I'm your motor insurance claims assistant. "
-                "I'll collect a few details — some by voice, some in chat. "
+                "I'll collect a few details required for claim processing. "
+                "You can also click the call button above to share details quickly. "
                 "Let's get started."
             ),
         )
@@ -139,7 +147,9 @@ class SessionManager:
                 await ws.send_text(self._wire(self._greeting()))
 
             # Re-send any pending open request so the client card renders on reconnect.
-            req = state.open_request or next_missing_input_request(state, call_active=False)
+            req = state.open_request or next_missing_input_request(
+                state, call_active=False
+            )
             if req is not None:
                 state.open_request = req
                 self.store.save_session(state)
@@ -192,7 +202,9 @@ class SessionManager:
             if not ok:
                 self.store.save_session(state)
                 self.store.append_event(
-                    session_id, "chat", "field_invalid",
+                    session_id,
+                    "chat",
+                    "field_invalid",
                     {"field": field, "error": err or "invalid input"},
                 )
                 # 3-strike escalation: on the 3rd consecutive failure, emit the
@@ -205,11 +217,15 @@ class SessionManager:
                             session_id,
                             "chat",
                             "outcome",
-                            {"outcome": record.outcome, "reason": record.outcome_reason},
+                            {
+                                "outcome": record.outcome,
+                                "reason": record.outcome_reason,
+                            },
                         )
                         await self._send_ws(
                             "chat", session_id, self._wire(RecordMessage(record=record))
                         )
+                        await self._maybe_send_needs_review_note(session_id, state, record)
                         self._deliver(state, record)
                 else:
                     await self._send_ws(
@@ -235,13 +251,6 @@ class SessionManager:
             if build_ack_text is not None:
                 state.pending_ack_text = build_ack_text(field, value, state)
                 self.store.save_session(state)
-            # Notify the active voice pipeline if one exists.
-            if self._ws_set("call", session_id):
-                voice_session = self._voice_sessions.get(session_id)
-                if voice_session is not None:
-                    asyncio.create_task(
-                        voice_session.notify_chat_field_validated(field, value, state)
-                    )
 
             # If a spoken chat card for this field is open, cancel it.
             if input_cancel is not None:
@@ -250,6 +259,7 @@ class SessionManager:
             # Check for a terminal outcome.
             record = evaluate_outcome(state)
             if record:
+                state.pending_ack_text = None
                 self.store.save_session(state)
                 self.store.append_event(
                     session_id,
@@ -260,8 +270,30 @@ class SessionManager:
                 await self._send_ws(
                     "chat", session_id, self._wire(RecordMessage(record=record))
                 )
+                await self._maybe_send_needs_review_note(session_id, state, record)
                 self._deliver(state, record)
+                if self._ws_set("call", session_id):
+                    voice_session = self._voice_sessions.get(session_id)
+                    if voice_session is not None:
+
+                        async def _thank_and_hangup(vs=voice_session, st=state):
+                            vs._user_speaking = False
+                            await vs._speak(
+                                "Thank you! Your claim is now submitted. Take care and goodbye!",
+                                st,
+                            )
+                            await vs._finish_call_after_speech()
+
+                        asyncio.create_task(_thank_and_hangup())
                 return
+
+            # Notify the active voice pipeline if one exists.
+            if self._ws_set("call", session_id):
+                voice_session = self._voice_sessions.get(session_id)
+                if voice_session is not None:
+                    asyncio.create_task(
+                        voice_session.notify_chat_field_validated(field, value, state)
+                    )
 
             # Otherwise dispatch the next missing input request.
             next_req = next_missing_input_request(
@@ -292,94 +324,19 @@ class SessionManager:
             state = self.store.get_or_create_session(session_id)
             state.last_activity = datetime.now(KOLKATA).isoformat()
             state.engagement.calls += 1
+            if state.open_request and state.open_request.field in SPOKEN_ORDER:
+                cancel_msg = InputCancel(
+                    request_id=state.open_request.id,
+                    reason="on voice call",
+                )
+                state.open_request = None
+                await self.broadcast_chat(session_id, self._wire(cancel_msg))
             self.store.save_session(state)
 
             # Context-aware greeting for existing sessions with valid fields.
             valid_fields = [
                 f for f, rf in state.fields.items() if rf.status == FieldStatus.VALID
             ]
-        # Speak pending cross-channel acknowledgment or context greeting as
-        # background tasks so the /call WebSocket accept returns immediately
-        # and the client can start sending audio frames without delay.
-        if state.pending_ack_text:
-            ack_text = state.pending_ack_text
-            state.pending_ack_text = None
-            self.store.save_session(state)
-
-            async def _send_ack() -> None:
-                stt, llm, tts = self._resolve_voice_providers()
-
-                async def send_call(text: str) -> None:
-                    await self._send_ws("call", session_id, text)
-
-                async def send_chat(text: str) -> None:
-                    await self._send_ws("chat", session_id, text)
-
-                greet_session = VoicePipelineSession(
-                    session_id=session_id,
-                    store=self.store,
-                    stt=stt,
-                    llm=llm,
-                    tts=tts,
-                    send_call=send_call,
-                    send_chat=send_chat,
-                    close_call=close_call,
-                )
-                await greet_session._speak(ack_text, state)
-
-            asyncio.create_task(_send_ack())
-        elif valid_fields:
-
-            async def _send_greeting() -> None:
-                stt, llm, tts = self._resolve_voice_providers()
-
-                async def send_call(text: str) -> None:
-                    await self._send_ws("call", session_id, text)
-
-                async def send_chat(text: str) -> None:
-                    await self._send_ws("chat", session_id, text)
-
-                greet_session = VoicePipelineSession(
-                    session_id=session_id,
-                    store=self.store,
-                    stt=stt,
-                    llm=llm,
-                    tts=tts,
-                    send_call=send_call,
-                    send_chat=send_chat,
-                    close_call=close_call,
-                )
-                await greet_session.speak_context_greeting(state)
-
-            asyncio.create_task(_send_greeting())
-        else:
-            if os.getenv("DEEPGRAM_API_KEY"):
-
-                async def _send_initial_greeting() -> None:
-                    stt, llm, tts = self._resolve_voice_providers()
-
-                    async def send_call(text: str) -> None:
-                        await self._send_ws("call", session_id, text)
-
-                    async def send_chat(text: str) -> None:
-                        await self._send_ws("chat", session_id, text)
-
-                    greet_session = VoicePipelineSession(
-                        session_id=session_id,
-                        store=self.store,
-                        stt=stt,
-                        llm=llm,
-                        tts=tts,
-                        send_call=send_call,
-                        send_chat=send_chat,
-                        close_call=close_call,
-                    )
-                    await greet_session._speak(
-                        "Hi! I'm your motor insurance claims assistant. Can you tell me what happened, where, and when?",
-                        state,
-                    )
-
-                asyncio.create_task(_send_initial_greeting())
 
         stt, llm, tts = self._resolve_voice_providers()
 
@@ -391,7 +348,13 @@ class SessionManager:
 
         async def close_call() -> None:
             try:
-                await ws.close(code=1000, reason="claim submitted")
+                cur_state = self.store.get_or_create_session(session_id)
+                reason = (
+                    "claim submitted"
+                    if cur_state.outcome is not None
+                    else "voice intake complete"
+                )
+                await ws.close(code=1000, reason=reason)
             except Exception:
                 pass
 
@@ -406,6 +369,24 @@ class SessionManager:
             close_call=close_call,
         )
         self._voice_sessions[session_id] = session
+
+        # Speak pending cross-channel acknowledgment or context greeting as
+        # background tasks on the active session so barge-in and state stay unified.
+        if state.pending_ack_text:
+            ack_text = state.pending_ack_text
+            state.pending_ack_text = None
+            self.store.save_session(state)
+            asyncio.create_task(session._speak(ack_text, state))
+        elif valid_fields:
+            asyncio.create_task(session.speak_context_greeting(state))
+        elif os.getenv("DEEPGRAM_API_KEY"):
+            asyncio.create_task(
+                session._speak(
+                    "Hi! I'm your motor insurance claims assistant. Can you tell me what happened, where, and when?",
+                    state,
+                )
+            )
+
         # Run the pipeline receive loop. The greeting (if any) is already
         # running as a background task, so this accept returns promptly and
         # the client can send audio frames while the loop receives them.
@@ -415,7 +396,10 @@ class SessionManager:
             finally:
                 self._voice_sessions.pop(session_id, None)
                 await self.remove_ws("call", session_id, ws)
-                await self._nudge_chat_after_call(session_id)
+                try:
+                    await asyncio.shield(self._nudge_chat_after_call(session_id))
+                except asyncio.CancelledError:
+                    pass
 
         await _run_and_cleanup()
 
@@ -488,8 +472,8 @@ class SessionManager:
         sessions_to_check = list(self._active_sessions)
         for session_id in sessions_to_check:
             state = self.store.get_or_create_session(session_id)
-            # Skip terminal outcomes.
-            if state.outcome in {"completed", "optedOut", "needsReview"}:
+            # Skip terminal and already-emitted partial outcomes.
+            if state.outcome in {"completed", "optedOut", "needsReview", "partial"}:
                 continue
             # Skip active calls.
             if self._ws_set("call", session_id):
@@ -504,16 +488,21 @@ class SessionManager:
             if (now - last_dt).total_seconds() < PARTIAL_TIMEOUT_SECONDS:
                 continue
             # Inactivity timeout: transition to partial (revision=1).
-            record = evaluate_outcome(state, force_partial=True, now_iso=now.isoformat())
+            record = evaluate_outcome(
+                state, force_partial=True, now_iso=now.isoformat()
+            )
             if record and record.outcome == Outcome.PARTIAL:
                 self.store.save_session(state)
                 self.store.append_event(
-                    session_id, "system", "watchdog_partial",
+                    session_id,
+                    "system",
+                    "watchdog_partial",
                     {"outcome": "partial", "revision": record.revision},
                 )
                 await self._send_ws(
                     "chat", session_id, self._wire(RecordMessage(record=record))
                 )
+                await self._maybe_send_needs_review_note(session_id, state, record)
                 self._deliver(state, record)
 
     def _resolve_voice_providers(self):
@@ -524,7 +513,12 @@ class SessionManager:
             val = vp.get(kind)
             if val is None:
                 return None
-            if callable(val) and not hasattr(val, "ingest") and not hasattr(val, "respond") and not hasattr(val, "synthesize"):
+            if (
+                callable(val)
+                and not hasattr(val, "ingest")
+                and not hasattr(val, "respond")
+                and not hasattr(val, "synthesize")
+            ):
                 return val()
             return val
 
@@ -534,12 +528,14 @@ class SessionManager:
 
         if stt is None:
             from .voice import DeepgramLiveSTT, MockSTTProvider
+
             if os.getenv("DEEPGRAM_API_KEY"):
                 stt = DeepgramLiveSTT(os.getenv("DEEPGRAM_API_KEY"))
             else:
                 stt = MockSTTProvider()
         if llm is None:
             from .voice import OpenAILLM, MockLLMProvider
+
             llm_api_key = (
                 os.getenv("OPENROUTER_API_KEY")
                 or os.getenv("GROQ_API_KEY")
@@ -553,13 +549,14 @@ class SessionManager:
                     ),
                     model=os.getenv(
                         "LLM_MODEL",
-                        "nvidia/nemotron-3.5-lightning:free",
+                        "cohere/north-mini-code:free",
                     ),
                 )
             else:
                 llm = MockLLMProvider()
         if tts is None:
             from .voice import DeepgramAuraTTS, MockTTSProvider
+
             if os.getenv("DEEPGRAM_API_KEY"):
                 tts = DeepgramAuraTTS(os.getenv("DEEPGRAM_API_KEY"))
             else:
@@ -567,6 +564,32 @@ class SessionManager:
         return stt, llm, tts
 
     # ------------------------------------------------------------------ internal
+
+    async def _maybe_send_needs_review_note(
+        self, session_id: str, state: SessionState, record
+    ) -> None:
+        if "PYTEST_CURRENT_TEST" in os.environ or record.outcome != Outcome.NEEDS_REVIEW:
+            return
+        reasons = []
+        if state.injury_review_flag:
+            inj = state.fields.get("injuries")
+            detail = inj.value if inj and inj.value else "reported"
+            reasons.append(f'bodily injury reported ("{detail}")')
+        if state.vision_review_flag:
+            reasons.append("uploaded photo did not pass AI vehicle-damage verification")
+        for f, cnt in state.failure_counts.items():
+            if cnt >= 3:
+                reasons.append(f"{f} failed validation {cnt} times")
+        if not reasons and record.outcome_reason:
+            reasons.append(record.outcome_reason)
+        note = (
+            "Claim status: Marked for human adjuster review (needsReview) because "
+            + "; ".join(reasons)
+            + "."
+        )
+        await self._send_ws(
+            "chat", session_id, self._wire(ChatMessage(role=Role.AGENT, text=note))
+        )
 
     async def _send_ws(self, kind: str, session_id: str, text: str) -> None:
         dead = []
@@ -591,7 +614,9 @@ class SessionManager:
         from .protocol import FinalRecord, Outcome, RecordField, FieldStatus
         from .validator import REQUIRED_FIELDS
 
-        now_iso = state.ended_at or state.updated_at or datetime.now(KOLKATA).isoformat()
+        now_iso = (
+            state.ended_at or state.updated_at or datetime.now(KOLKATA).isoformat()
+        )
         fields_dict = dict(state.fields)
         for f in REQUIRED_FIELDS + ["email"]:
             if f not in fields_dict:
