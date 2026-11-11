@@ -330,3 +330,151 @@ def test_static_asset_mount():
     # API route is not shadowed by static mount
     resp = client.get("/sessions/s_static/telemetry")
     assert resp.status_code == 200
+
+
+# =============================================================================
+# Progressive spoken refinement & non-degradation guards
+# =============================================================================
+
+def test_spoken_field_progressive_refinement_without_keyword():
+    """Caller can enrich an earlier spoken field on a later turn without 'actually'/'sorry',
+    while accidental shrinking or time drift without time cues is ignored."""
+    from backend.app.voice import (
+        VoicePipelineSession,
+        MockSTTProvider,
+        MockLLMProvider,
+        MockTTSProvider,
+        STTEvent,
+        LLMResult,
+    )
+    from backend.app.store import SessionStore
+    from backend.app.protocol import FieldStatus
+
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        store = SessionStore(db_path)
+
+        async def noop_send(text: str):
+            pass
+
+        llm = MockLLMProvider([
+            [LLMResult(kind="tool", tool="record_spoken_fields", arguments={
+                "incidentDescription": "I had a car accident.",
+                "incidentTime": "2 hours ago",
+            })],
+            [LLMResult(kind="tool", tool="record_spoken_fields", arguments={
+                "incidentLocation": "Bandra Kurla Complex, Mumbai",
+                "incidentDescription": (
+                    "I had a car accident at Bandra Kurla Complex when a delivery van hit my left door."
+                ),
+                # Attempted unprompted re-send of time with no time cue in transcript:
+                "incidentTime": "today at 1:00am",
+            })],
+            [LLMResult(kind="tool", tool="record_spoken_fields", arguments={
+                "injuries": "none",
+                # Attempted shorter truncation without explicit correction cue:
+                "incidentDescription": "car accident",
+            })],
+        ])
+        stt = MockSTTProvider([
+            [STTEvent(kind="transcript", text="I had a car accident about 2 hours ago.", is_final=True)],
+            [STTEvent(kind="transcript", text="Near Bandra Kurla Complex, a delivery van hit my left door.", is_final=True)],
+            [STTEvent(kind="transcript", text="Nobody was hurt.", is_final=True)],
+        ])
+        session = VoicePipelineSession(
+            session_id="s_refine",
+            store=store,
+            stt=stt,
+            llm=llm,
+            tts=MockTTSProvider(chunks=1, delay=0.001),
+            send_call=noop_send,
+            send_chat=noop_send,
+            close_call=None,
+        )
+
+        import asyncio
+        asyncio.run(session.handle_binary(b"\x00\x00" * 320))
+        first_time = store.get_or_create_session("s_refine").fields["incidentTime"].value
+
+        # Simulate agent having asked about location on turn 2:
+        session._history.append({"role": "assistant", "content": "Where did this incident occur?"})
+        asyncio.run(session.handle_binary(b"\x00\x00" * 320))
+        st2 = store.get_or_create_session("s_refine")
+        assert "delivery van hit my left door" in st2.fields["incidentDescription"].value
+        assert st2.fields["incidentLocation"].value == "Bandra Kurla Complex, Mumbai"
+        assert st2.fields["incidentTime"].value == first_time
+
+        session._history.append({"role": "assistant", "content": "Was anyone injured?"})
+        asyncio.run(session.handle_binary(b"\x00\x00" * 320))
+        st3 = store.get_or_create_session("s_refine")
+        assert st3.fields["injuries"].value == "none"
+        assert st3.fields["injuries"].status == FieldStatus.VALID
+        # Rich description must NOT shrink back down to 'car accident'
+        assert "delivery van hit my left door" in st3.fields["incidentDescription"].value
+    finally:
+        os.unlink(db_path)
+
+
+def test_delayed_injury_disclosure_flips_review_flag():
+    """Reporting an injury later in the call after initially saying 'none' updates
+    injuries and sets injury_review_flag=True even without 'actually'/'sorry'."""
+    from backend.app.voice import (
+        VoicePipelineSession,
+        MockSTTProvider,
+        MockLLMProvider,
+        MockTTSProvider,
+        STTEvent,
+        LLMResult,
+    )
+    from backend.app.store import SessionStore
+
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        store = SessionStore(db_path)
+
+        async def noop_send(text: str):
+            pass
+
+        llm = MockLLMProvider([
+            [LLMResult(kind="tool", tool="record_spoken_fields", arguments={
+                "incidentDescription": "Rear-ended by a cab",
+                "incidentLocation": "NH48",
+                "incidentTime": "1 hour ago",
+                "injuries": "none",
+            })],
+            [LLMResult(kind="tool", tool="record_spoken_fields", arguments={
+                "vehicleDrivable": False,
+                "injuries": "passenger neck hurts badly",
+            })],
+        ])
+        stt = MockSTTProvider([
+            [STTEvent(kind="transcript", text="Rear-ended by a cab on NH48 an hour ago, nobody is hurt.", is_final=True)],
+            [STTEvent(kind="transcript", text="The car cannot move and my passenger says his neck hurts badly.", is_final=True)],
+        ])
+        session = VoicePipelineSession(
+            session_id="s_injury_flip",
+            store=store,
+            stt=stt,
+            llm=llm,
+            tts=MockTTSProvider(chunks=1, delay=0.001),
+            send_call=noop_send,
+            send_chat=noop_send,
+            close_call=None,
+        )
+
+        import asyncio
+        asyncio.run(session.handle_binary(b"\x00\x00" * 320))
+        st1 = store.get_or_create_session("s_injury_flip")
+        assert st1.fields["injuries"].value == "none"
+        assert st1.injury_review_flag is False
+
+        session._history.append({"role": "assistant", "content": "Is the vehicle still drivable?"})
+        asyncio.run(session.handle_binary(b"\x00\x00" * 320))
+        st2 = store.get_or_create_session("s_injury_flip")
+        assert st2.fields["vehicleDrivable"].value is False
+        assert st2.fields["injuries"].value == "passenger neck hurts badly"
+        assert st2.injury_review_flag is True
+    finally:
+        os.unlink(db_path)

@@ -41,6 +41,7 @@ from .protocol import (
     InputCancel,
     InputKind,
     InputRequest,
+    RecordField,
     RecordMessage,
     Role,
     SessionState,
@@ -382,8 +383,11 @@ class OpenAILLM(LLMProvider):
             f"Current session state: {state_summary}. "
             "ALWAYS call record_spoken_fields when the user provides any spoken claim details "
             "(incidentDescription, incidentLocation, incidentTime, injuries, vehicleDrivable). "
-            "Record ONLY new or updated fields the user explicitly stated in their latest turn; "
-            "do NOT re-send or overwrite already collected fields unless the user explicitly corrects them. "
+            "Extract ALL explicitly stated fields in one call if the user gives multiple details together. "
+            "If the user adds richer details, completes an unfinished phrase, or corrects a previously recorded field "
+            "(e.g., adding vehicle/impact context to incidentDescription or updating injuries/time), "
+            "call record_spoken_fields with the merged or corrected value preserving earlier specifics. "
+            "Do NOT re-emit unchanged previously collected fields (especially incidentTime) when the user did not add to or modify them. "
             "NEVER guess, infer, or fill default values "
             "for unmentioned fields (especially injuries or vehicleDrivable). "
             "Ask ONLY for the single next missing spoken field in 1-2 short plain spoken sentences. "
@@ -1042,6 +1046,62 @@ class VoicePipelineSession:
 
         return False
 
+    @staticmethod
+    def _should_skip_call_update(
+        field_name: str,
+        existing: Optional[RecordField],
+        new_value: Any,
+        user_transcript: Optional[str],
+    ) -> bool:
+        """Guard valid CALL fields against silent truncation, injury erasure, or time drift."""
+        if (
+            user_transcript is None
+            or existing is None
+            or existing.status != FieldStatus.VALID
+            or existing.source != FieldSource.CALL
+        ):
+            return False
+
+        t_low = user_transcript.lower()
+        explicit_corr = any(
+            k in t_low
+            for k in (
+                "actually", "correction", "sorry", "meant to say",
+                "instead", "change my", "wrong", "wait",
+            )
+        )
+        if field_name == "incidentTime" and not explicit_corr:
+            has_time_cue = any(ch.isdigit() for ch in t_low) or bool(
+                re.search(
+                    r"\b(?:am|pm|a\.m\.|p\.m\.|o'clock|hours?|minutes?|mins?|"
+                    r"today|yesterday|morning|afternoon|evening|night|midnight|"
+                    r"noon|ago|earlier|later)\b",
+                    t_low,
+                )
+            )
+            if not has_time_cue:
+                return True
+
+        if (
+            field_name in ("incidentDescription", "incidentLocation")
+            and isinstance(existing.value, str)
+            and isinstance(new_value, str)
+            and len(new_value.strip()) + 4 < len(existing.value.strip())
+            and not explicit_corr
+        ):
+            return True
+
+        if (
+            field_name == "injuries"
+            and isinstance(existing.value, str)
+            and existing.value != "none"
+            and str(new_value).strip().lower() in ("none", "no", "nobody", "no one hurt")
+            and not explicit_corr
+        ):
+            return True
+
+        return False
+
     async def _tool_record_spoken_fields(
         self,
         arguments: dict,
@@ -1067,27 +1127,10 @@ class VoicePipelineSession:
             if field_name not in arguments or arguments[field_name] is None:
                 continue
             existing = state.fields.get(field_name)
-            if (
-                user_transcript is not None
-                and existing is not None
-                and existing.status == FieldStatus.VALID
-                and existing.source == FieldSource.CALL
+            if self._should_skip_call_update(
+                field_name, existing, arguments[field_name], user_transcript
             ):
-                corr_kw = (
-                    "actually", "correction", "sorry", "meant to say",
-                    "instead", "change my", "wrong",
-                )
-                prompt_kws = {
-                    "incidentDescription": ("what happened", "incident", "describe"),
-                    "incidentLocation": ("where", "location", "place"),
-                    "incidentTime": ("when", "time"),
-                    "injuries": ("injur", "hurt"),
-                    "vehicleDrivable": ("driv", "tow"),
-                }
-                p_low = last_prompt.lower()
-                asked_same = any(k in p_low for k in prompt_kws.get(field_name, ()))
-                if not asked_same and not any(k in user_transcript.lower() for k in corr_kw):
-                    continue
+                continue
             if user_transcript is not None and not self._is_spoken_field_grounded(
                 field_name, user_transcript, last_prompt, next_expected
             ):
@@ -1300,7 +1343,7 @@ class VoicePipelineSession:
             if state.fields.get(f) is None or state.fields.get(f).status != FieldStatus.VALID
         ]
         return (
-            f"collected (do not overwrite): {', '.join(collected) if collected else 'none'}; "
+            f"collected (keep stable unless user adds context or corrects): {', '.join(collected) if collected else 'none'}; "
             f"missing: {', '.join(missing) if missing else 'none'}; "
             f"injury_review_flag={state.injury_review_flag}; "
             f"confirm_rejections={state.confirm_rejections}"
